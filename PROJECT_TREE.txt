@@ -1,0 +1,28 @@
+novel_pipeline/
+├── requirements.txt
+├── config.py
+├── state.py
+├── llm_factory.py
+├── agents/
+│   ├── __init__.py
+│   ├── memory_manager.py
+│   ├── plot_parser.py
+│   ├── episode_aggregator.py
+│   ├── material_generator.py
+│   ├── review_character.py
+│   ├── review_foreshadow.py
+│   ├── review_timeline.py
+│   ├── review_atmosphere.py
+│   └── review_arbiter.py
+├── nodes/
+│   ├── __init__.py
+│   ├── text_chunker.py
+│   ├── format_validator.py
+│   ├── memory_prefetch.py
+│   ├── persistence.py
+│   ├── routing.py
+│   └── retry_counter.py
+├── graph/
+│   ├── __init__.py
+│   └── builder.py
+└── main.py

@@ -1,0 +1,27 @@
+# 运行时产生的数据（不入库）
+output/
+checkpoints/
+memory/
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# 日志与临时文件
+*.log
+run.log
+raw_material_output.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp

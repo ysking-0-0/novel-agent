@@ -1,0 +1,26 @@
+{
+  "model": {
+    "production_model": "MiniMax-M3",
+    "review_model": "MiniMax-M3",
+    "support_model": "MiniMax-M3",
+    "api_key": "sk-cp-xxxx 替换为你的真实 key",
+    "base_url": "https://api.minimaxi.com/v1",
+    "temperature": 0.3,
+    "max_tokens": 8192
+  },
+  "run": {
+    "novel_file_path": "./data/novel.txt",
+    "chunk_size": 8000,
+    "target_episode_count": null,
+    "max_retries": 2,
+    "min_scenes_per_episode": 3,
+    "max_scenes_per_episode": 8
+  },
+  "storage": {
+    "output_dir": "./output",
+    "sqlite_path": "./checkpoints/checkpoint.sqlite",
+    "memory_dir": "./memory",
+    "enable_vector_retrieval": true,
+    "vector_dim": 1536
+  }
+}

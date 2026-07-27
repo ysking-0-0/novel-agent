@@ -1,0 +1,11 @@
+langgraph==0.2.50
+langgraph-checkpoint-sqlite==2.0.1
+langchain==0.3.7
+langchain-core==0.3.7
+langchain-community==0.3.7
+langchain-openai==0.2.9
+pydantic==2.9.2
+faiss-cpu==1.9.0
+numpy==1.26.4
+openai==1.55.0
+sqlalchemy==2.0.36
