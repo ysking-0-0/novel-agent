@@ -33,10 +33,11 @@
     "video_resolution": "1280x720",
     "video_fps": 30,
     "voice_mapping": {
+      "narrator": "male-qn-jingying",
       "narrator_male": "male-qn-jingying",
       "narrator_female": "female-shaonv",
-      "character_male": "male-qn-badao",
-      "character_female": "female-shaonv"
+      "钟岳": "male-qn-badao",
+      "薪火": "female-yujie"
     },
     "default_voice_id": "male-qn-jingying"
   }

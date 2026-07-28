@@ -119,9 +119,9 @@ def get_or_create_portrait(char_id: str, appearance_desc: str) -> Optional[str]:
         return path
 
     portrait_prompt = (
-        "Character reference portrait, front view, neutral background, full face visible. "
+        "anime style, character reference portrait, front view, neutral background, full face visible. "
         + (appearance_desc or char_id)
-        + ". Clean lighting, high detail, consistent character design sheet."
+        + ". Clean lighting, high detail, consistent anime character design sheet."
     )
     print("    [定妆照] 首次生成 %s" % char_id)
     url = _call_image_api(portrait_prompt, reference_image_b64=None)
@@ -276,28 +276,54 @@ def _call_tts_api(text: str, voice_id: str, emotion: str, speed: float) -> Optio
 
 
 def _resolve_voice_id(voice_field: str) -> str:
-    """把 tts_meta.voice 映射到 MiniMax voice_id。"""
+    """把 tts_meta.voice（角色名/旁白标识）映射到 MiniMax voice_id。
+    精确匹配 voice_mapping → 模糊匹配（含关键词）→ 默认音色。
+    """
     cfg = get_config()
     if not voice_field:
         return cfg.media.default_voice_id
-    if voice_field in cfg.media.voice_mapping:
-        return cfg.media.voice_mapping[voice_field]
-    if voice_field.startswith("character_"):
-        return cfg.media.default_voice_id
-    return voice_field if voice_field else cfg.media.default_voice_id
+    vf = voice_field.strip()
+    # 精确匹配
+    if vf in cfg.media.voice_mapping:
+        return cfg.media.voice_mapping[vf]
+    # 模糊匹配（voice_field 含 mapping 的某个 key）
+    for key, vid in cfg.media.voice_mapping.items():
+        if key in vf or vf in key:
+            return vid
+    # 兼容旧格式 character_male / character_female
+    if "female" in vf.lower():
+        return cfg.media.voice_mapping.get("narrator_female", "female-shaonv")
+    # 未映射的角色名 → 默认音色
+    return cfg.media.default_voice_id
 
 
 # MiniMax T2A 支持的 emotion 白名单 + pipeline 产出值到白名单的映射
 _TTS_EMOTION_WHITELIST = {"neutral", "happy", "sad", "angry", "disgusted", "surprised", "calm"}
 _TTS_EMOTION_MAP = {
-    "tense": "angry",      # 紧张 → 愤怒（最接近的可表达）
+    "tense": "angry",      # 紧张 → 愤怒
     "excited": "happy",    # 兴奋 → 开心
     "afraid": "surprised", # 害怕 → 惊讶
     "fear": "surprised",
+    "fearful": "surprised",
     "serious": "neutral",
     "narration": "neutral",
     "friendly": "happy",
     "relaxed": "calm",
+    "intrigued": "neutral",  # 好奇 → 中性
+    "horrified": "surprised",# 惊恐 → 惊讶
+    "shocked": "surprised",  # 震惊 → 惊讶
+    "curious": "neutral",    # 好奇 → 中性
+    "nervous": "angry",      # 紧张 → 愤怒
+    "anxious": "angry",      # 焦虑 → 愤怒
+    "desperate": "sad",      # 绝望 → 悲伤
+    "determined": "angry",   # 坚定 → 愤怒
+    "mysterious": "neutral", # 神秘 → 中性
+    "joyful": "happy",       # 喜悦 → 开心
+    "angry": "angry",
+    "sad": "sad",
+    "calm": "calm",
+    "happy": "happy",
+    "surprised": "surprised",
 }
 
 

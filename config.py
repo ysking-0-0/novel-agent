@@ -82,13 +82,18 @@ class MediaConfig:
     video_resolution: str = os.getenv("VIDEO_RESOLUTION", "1280x720")
     # 视频帧率
     video_fps: int = int(os.getenv("VIDEO_FPS", "30"))
-    # 角色音色映射：tts_meta.voice 值 → MiniMax voice_id
-    # narrartor_male 等占位值映射到具体音色
+    # 角色音色映射：tts_meta.voice 值（角色名/旁白标识）→ MiniMax voice_id
+    # 可用 voice_id：male-qn-jingying(男精英) male-qn-badao(男霸道)
+    #   female-shaonv(女少女) female-chengshu(女成熟) female-tianmei(女甜美)
+    #   female-yujie(女御姐) presenter_male(男主持) presenter_female(女主持)
+    # 角色名直接映射；旁白用 narrator
     voice_mapping: dict = field(default_factory=lambda: {
+        "narrator": "male-qn-jingying",
         "narrator_male": "male-qn-jingying",
         "narrator_female": "female-shaonv",
-        "character_male": "male-qn-badao",
-        "character_female": "female-shaonv",
+        # 角色→音色（按需在此添加，角色名须与剧情解析一致）
+        "钟岳": "male-qn-badao",
+        "薪火": "female-yujie",
     })
     # 默认音色（voice_mapping 中找不到时用）
     default_voice_id: str = os.getenv("DEFAULT_VOICE_ID", "male-qn-jingying")
