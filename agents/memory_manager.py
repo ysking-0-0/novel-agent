@@ -82,10 +82,51 @@ class _MemoryStore:
                     json.dump(self._vector_meta, f, ensure_ascii=False, indent=2)
 
     # ---------- 人物档案 ----------
+    # 固定外貌字段：一旦建立就不被后续场景覆盖（保证人物一致性）
+    _FIXED_PROFILE_FIELDS = ("appearance", "age", "identity", "personality")
+
     def upsert_character(self, char_id: str, profile: Dict):
         with self._lock:
             existing = self.character_profiles.get(char_id, {})
-            existing.update(profile)
+            # appearance_override=true：变形/易容/化妆/法术变身，允许更新固定外貌字段
+            override = profile.get("appearance_override") is True
+            if override:
+                # 变形场景：更新所有传入的固定字段（appearance/age 等）
+                for k in self._FIXED_PROFILE_FIELDS:
+                    v = profile.get(k)
+                    if v:
+                        existing[k] = v
+            else:
+                # 正常场景：固定字段只在档案中尚无该值时写入；已有则保留原值
+                for k in self._FIXED_PROFILE_FIELDS:
+                    v = profile.get(k)
+                    if v and not existing.get(k):
+                        existing[k] = v
+            # attire（穿着）：与 identity 绑定。identity 不变 → attire 保持原值
+            # 只有 identity 发生明确变化（如外门弟子→内门弟子）时才允许更新 attire 和 identity
+            new_attire = profile.get("attire")
+            new_identity = profile.get("identity")
+            old_identity = existing.get("identity")
+            if new_attire:
+                if not existing.get("attire"):
+                    # 首次写入
+                    existing["attire"] = new_attire
+                elif new_identity and old_identity and new_identity != old_identity:
+                    # identity 变化才更新 attire
+                    existing["attire"] = new_attire
+                elif override:
+                    # 变形场景也允许更新 attire
+                    existing["attire"] = new_attire
+                # 否则保持原 attire（identity 未变，穿着不变）
+            # identity：身份明确变化时更新（如外门弟子→内门弟子）
+            if new_identity and old_identity and new_identity != old_identity:
+                existing["identity"] = new_identity
+            # 可变字段（state_change/is_new/appearance_override 等）常规更新
+            for k, v in profile.items():
+                if k in self._FIXED_PROFILE_FIELDS or k == "attire":
+                    continue  # 已上面处理
+                if v is not None:
+                    existing[k] = v
             existing["char_id"] = char_id
             self.character_profiles[char_id] = existing
 

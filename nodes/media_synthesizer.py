@@ -136,30 +136,48 @@ def get_or_create_portrait(char_id: str, appearance_desc: str) -> Optional[str]:
 
 
 def _collect_characters(episode: Dict) -> Dict[str, str]:
-    """从 episode 中收集角色 ID → 外貌描述。"""
-    chars = {}
+    """从 episode 中收集角色 ID → 完整外貌描述（用于定妆照）。
+
+    优先用记忆库人物档案的固定字段（age/identity/appearance/attire/personality）
+    组合成完整外貌描述；档案缺失时回退到 scene 内的 appearance/state_change。
+    """
+    chars: Dict[str, str] = {}
+    # 先从 episode scenes 收集所有角色 ID（保持出场顺序）
     for sc in episode.get("scenes", []):
         for c in sc.get("characters", []):
             if isinstance(c, dict):
                 cid = c.get("char_id") or c.get("name")
                 if cid and cid not in chars:
+                    # scene 内可能带 appearance（plot_parser 新输出）
                     desc = c.get("appearance") or c.get("state_change") or cid
                     chars[cid] = desc
-    # 优先用记忆库人物档案的外貌
+    # 用记忆库人物档案的固定字段组合成完整外貌描述
     try:
         from agents import get_memory_agent
         mem = get_memory_agent()
         for cid in list(chars.keys()):
             prof = mem.get_character(cid)
-            if prof and prof.get("appearance"):
-                chars[cid] = prof["appearance"]
+            if prof:
+                # 组合固定字段 → 完整外貌描述
+                parts = []
+                for k in ("age", "identity", "appearance", "attire", "personality"):
+                    v = prof.get(k, "")
+                    if v:
+                        parts.append(f"{k}: {v}")
+                if parts:
+                    chars[cid] = "; ".join(parts)
+                elif prof.get("appearance"):
+                    chars[cid] = prof["appearance"]
     except Exception:
         pass
     return chars
 
 
 def generate_images(episode: Dict, prompts: List[str], ep_dir: str) -> List[Optional[str]]:
-    """并发生图，返回本地图片路径列表（与 prompts 等长，失败为 None）。"""
+    """并发生图，返回本地图片路径列表（与 prompts 等长，失败为 None）。
+
+    人物一致性：每张图根据 prompt 文本匹配涉及的角色，用对应角色定妆照作参考。
+    """
     cfg = get_config()
     img_dir = os.path.join(ep_dir, "images")
     os.makedirs(img_dir, exist_ok=True)
@@ -171,24 +189,48 @@ def generate_images(episode: Dict, prompts: List[str], ep_dir: str) -> List[Opti
         if p:
             char_portraits[cid] = p
 
-    # 取主角定妆照作统一参考
-    primary_ref_b64: Optional[str] = None
-    if char_portraits:
-        first_path = next(iter(char_portraits.values()))
-        primary_ref_b64 = _image_to_base64(first_path)
+    # 预计算每个角色定妆照的 base64（避免每张图重复读取）
+    portrait_b64: Dict[str, str] = {}
+    for cid, path in char_portraits.items():
+        b64 = _image_to_base64(path)
+        if b64:
+            portrait_b64[cid] = b64
 
-    if primary_ref_b64:
-        print("    [生图] 使用定妆照参考: %d 张角色定妆照就绪" % len(char_portraits))
+    # 主角定妆照作 fallback 参考
+    primary_ref_b64: Optional[str] = next(iter(portrait_b64.values()), None) if portrait_b64 else None
+
+    if portrait_b64:
+        print("    [生图] 使用定妆照参考: %d 张角色定妆照就绪" % len(portrait_b64))
     else:
         print("    [生图] 无定妆照，纯 prompt 生成（人物可能不一致）")
 
     results: List[Optional[str]] = [None] * len(prompts)
 
+    def _match_portrait(prompt_item) -> Optional[str]:
+        """根据 image_prompt 的 characters 字段匹配定妆照。
+        characters 是 char_id 列表（如 ['钟岳','薪火']）。
+        优先用第一个匹配到的角色定妆照；无匹配→主角 fallback。
+        """
+        if not portrait_b64:
+            return None
+        # characters 字段（List[str]）
+        char_list = prompt_item.get("characters", []) if isinstance(prompt_item, dict) else []
+        for cid in char_list:
+            if cid in portrait_b64:
+                return portrait_b64[cid]
+        # 回退：prompt 文本含中文角色名
+        prompt_text = prompt_item.get("prompt", "") if isinstance(prompt_item, dict) else str(prompt_item)
+        for cid in portrait_b64:
+            if cid in prompt_text:
+                return portrait_b64[cid]
+        return primary_ref_b64
+
     def _one(idx_prompt):
         idx, prompt = idx_prompt
-        # 支持 dict（含 prompt + narration_segment）或纯 str
+        # 支持 dict（含 prompt + narration_segment + characters）或纯 str
         prompt_text = prompt.get("prompt") if isinstance(prompt, dict) else str(prompt)
-        url = _call_image_api(prompt_text, reference_image_b64=primary_ref_b64)
+        ref_b64 = _match_portrait(prompt)
+        url = _call_image_api(prompt_text, reference_image_b64=ref_b64)
         if not url:
             return idx, None
         dest = os.path.join(img_dir, "%03d.png" % idx)

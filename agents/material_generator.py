@@ -45,7 +45,8 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
     {
       "index": 1,
       "narration_segment": "对应 tts_meta 的第几段（整数，语音播放到该段时展示此图）",
-      "prompt": "以 'ancient Chinese mythology art style, ' 开头的生图Prompt，必须包含：(1) 风格前缀 (2) 人物外貌（英俊帅气/美丽动人，发色发型发饰，服饰须符合境界身份）(3) 精确动作与表情 (4) 场景环境（古朴蛮荒磅礴）(5) 关键视觉特征精确写出（四翼金鸟必须写'four-winged golden bird with four distinct wings spread'，不可只写'bird'）(6) 神话氛围光影 (7) 镜头构图",
+      "characters": ["本图涉及的角色 char_id 列表（如 ['钟岳','薪火']），用于匹配定妆照保证人物一致",
+      "prompt": "以 'ancient Chinese mythology art style, ' 开头的生图Prompt，必须包含：(1) 风格前缀 (2) 人物固定外貌——age年龄、identity身份、appearance发色发型/眼/眉/身材/五官（100%沿用档案，不得改变）、attire穿着 (3) 精确动作与表情 (4) 场景环境（古朴蛮荒磅礴）(5) 关键视觉特征精确写出（四翼金鸟必须写'four-winged golden bird with four distinct wings spread'，不可只写'bird'）(6) 神话氛围光影 (7) 镜头构图。同一人物在所有图中外貌特征完全一致",
       "mood": "本画面情绪关键词"
     }
   ],
@@ -63,7 +64,11 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
 
 严格要求：
 1. 讲解文案必须清晰交代本集的因果链与伏笔，不要遗漏关键事实
-2. 生图 Prompt 中人物外貌必须100%沿用给定的人物档案，不得擅自改变设定
+2. 【人物一致性（最高优先级）】生图 Prompt 中人物外貌必须100%沿用给定的人物档案：
+   - 必须包含档案中的 age（年龄）、identity（身份）、appearance（固定外貌：发色发型/眼/眉/身材/五官）、attire（穿着）
+   - 不得擅自改变年龄、外貌、体型——人物不会突然变老/变年轻/换发型/换体型
+   - 同一人物在所有图中必须保持相同的外貌特征（发色、发型、眼型、体型、五官）
+   - 若档案中某人物缺少 appearance 字段，从 identity 和原文细节合理推断一次并全程保持
 3. 生图 Prompt 必须以 'ancient Chinese mythology art style, ' 开头
 4. 人物必须英俊帅气（男）/美丽动人（女），服饰符合境界身份，发饰古风
 5. 关键视觉特征必须精确描述：怪物的形态（几翼/几首/几尾）、武器外形、特殊道具、环境特征，不可用模糊词
@@ -153,13 +158,18 @@ class MaterialGeneratorAgent:
                             narr_seg = int(narr_seg) if narr_seg is not None else None
                         except (ValueError, TypeError):
                             narr_seg = None
+                        # characters 字段：本图涉及的角色 char_id 列表（用于匹配定妆照）
+                        chars_in_img = p.get("characters", [])
+                        if not isinstance(chars_in_img, list):
+                            chars_in_img = []
                         normalized.append({
                             "prompt": prompt_text,
                             "narration_segment": narr_seg,
                             "mood": p.get("mood", ""),
+                            "characters": chars_in_img,
                         })
                     else:
-                        normalized.append({"prompt": str(p), "narration_segment": None, "mood": ""})
+                        normalized.append({"prompt": str(p), "narration_segment": None, "mood": "", "characters": []})
                 data["image_prompts"] = normalized
             return data
         # 兜底
