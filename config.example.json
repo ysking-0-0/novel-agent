@@ -33,12 +33,12 @@
     "video_resolution": "1280x720",
     "video_fps": 30,
     "voice_mapping": {
-      "narrator": "male-qn-jingying",
-      "narrator_male": "male-qn-jingying",
-      "narrator_female": "female-shaonv",
-      "钟岳": "male-qn-badao",
-      "薪火": "female-yujie"
+      "narrator": "Chinese_gravelly_storyteller_nv1",
+      "narrator_male": "Chinese_gravelly_storyteller_nv1",
+      "narrator_female": "Chinese (Mandarin)_Sweet_Lady",
+      "钟岳": "Chinese_worker_male",
+      "薪火": "Chinese (Mandarin)_Sweet_Lady"
     },
-    "default_voice_id": "male-qn-jingying"
+    "default_voice_id": "Chinese_gravelly_storyteller_nv1"
   }
 }

@@ -91,11 +91,11 @@ persistence → media_synthesizer → [route_after_persistence] → text_chunker
 
 基于 Episode 因果链，一次性并行产出三类素材：
 
-| 产出 | 字段 | 要求 |
-|---|---|---|
-| 讲解文案 | `script` | 600-1200 字口播文本，用『』分段，每段对应一个画面节拍 |
-| 生图 Prompt | `image_prompts` | 每段英文/中文 Prompt，含人物外貌（100% 沿用档案）、动作、场景、光影、构图 |
-| TTS 参数 | `tts_meta` | 每段 text/voice/emotion/speed/pause_after，与 script 段段对齐 |
+| 媒体 | 描述 |
+|---|---|
+| 讲解文案 | 600-1200 字口播文本，用『』分段，每段对应一个画面节拍 |
+| 生图 Prompt | List[dict]，每个含 prompt（以 `ancient Chinese mythology art style, ` 开头）、narration_segment（对应第几段语音）、mood（情绪关键词）。图片粒度细：每个场景/动作一张图，图片数通常多于语音段数 |
+| TTS 参数 | 每段 text/voice/emotion/speed/pause_after，与 script 段段对齐 |
 
 约束：不新增剧情、不篡改事实，文案是对原文的口语化转述。调用记忆 Agent 取关联人物档案，确保生图 Prompt 严格沿用人物设定。
 
@@ -155,15 +155,15 @@ persistence → media_synthesizer → [route_after_persistence] → text_chunker
 
 纯代码节点，persistence 后自动触发，把上一阶段产出的 Prompt/参数落成真实媒体文件并拼成讲解视频。
 
-**人物一致性方案**：为每个主要角色预生成一张「定妆照」（portrait prompt + 中性背景），后续该角色出现的所有画面生成时都带 `reference_image`（定妆照 base64）作为参考，确保外貌在整集内保持一致。定妆照缓存在 `output/_character_refs/` 跨集复用。
+**人物一致性方案**：为每个主要角色预生成一张「定妆照」（portrait prompt + 中性背景），后续该角色出现的所有画面生成时都带 `reference_image`（定妆照 base64）作为参考，确保外貌在整集内保持一致。定妆照缓存在 `memory/character_portraits/` 跨集复用。
 
 **三阶段流程**：
 
 | 阶段 | 操作 | 接口 |
 |---|---|---|
-| 1. 生图 | 遍历 image_prompts，并发（默认 3）调生图接口，带定妆照参考 | MiniMax `/v1/image_generation` (model=image-01) |
+| 1. 生图 | 遍历 image_prompts（List[dict]，含 narration_segment），并发（默认 3）调生图接口，带定妆照参考。Prompt 必须以 `ancient Chinese mythology art style, ` 开头 | MiniMax `/v1/image_generation` (model=image-01) |
 | 2. TTS | 遍历 tts_meta，串行（防限流）调语音合成，解码 hex 音频落盘 | MiniMax `/v1/t2a_v2` (model=speech-02-hd) |
-| 3. 视频 | 每段 = 图片 + 音频 → FFmpeg 合成片段 mp4；concat 拼接 → 完整视频 | imageio-ffmpeg (静态 ffmpeg 二进制) |
+| 3. 视频 | 按 narration_segment 把图片分组到对应语音段，同段内多图均分音频时长展示（`-ss` 切片）；每段 = 图片+对应音频切片 → FFmpeg 合成片段 mp4；concat 拼接 → 完整视频 | imageio-ffmpeg (静态 ffmpeg 二进制) |
 
 **关键工程坑与修复**（实测发现）：
 
@@ -175,7 +175,12 @@ persistence → media_synthesizer → [route_after_persistence] → text_chunker
 | concat 拼接失败 | concat demuxer 按相对路径重复拼接 | concat.txt 用绝对路径 |
 | 图片 URL 过期 | OSS 签名 URL 24 小时失效 | 生成后即时下载落盘 |
 
-**音色映射**：`tts_meta.voice` 字段值（如 `narrator_male`）→ MiniMax voice_id（如 `male-qn-jingying`）通过 `voice_mapping` 配置映射，可在 config.json 覆盖。
+**音色映射**：`tts_meta.voice` 字段值（角色名或 `narrator`）→ MiniMax voice_id 通过 `voice_mapping` 配置映射。当前内置音色：
+- 旁白 → `Chinese_gravelly_storyteller_nv1`（沉稳说书人）
+- 女性角色（如薪火）→ `Chinese (Mandarin)_Sweet_Lady`（甜美女声）
+- 男性角色（如钟岳）→ `Chinese_worker_male`
+- 默认音色 → `Chinese_gravelly_storyteller_nv1`
+- 可在 config.json 的 `media.voice_mapping` 按角色名添加/覆盖
 
 ### 八、全局记忆管理 Agent（memory_manager）
 
@@ -209,74 +214,107 @@ SqliteSaver 自动保存每个节点完成后的完整 NovelState 快照（threa
 
 ## 快速开始
 
-### 1. 安装依赖
+### 0. 你需要准备什么
+
+运行本系统**只需要两样东西**：
+
+| 材料 | 说明 | 获取方式 |
+|---|---|---|
+| **MiniMax API Key** | 调用大模型/生图/TTS 三个接口的统一凭证 | 在 [MiniMax 开放平台](https://platform.minimaxi.com/) 注册账号 → 创建 API Key，形如 `sk-cp-xxxxxxxx` |
+| **一部小说文本文件** | 纯文本 `.txt`，UTF-8 或 GBK 编码均可（系统自适应解码）。中文小说最佳，带「第X章」类章节标题时分片更精准 | 任意来源（已购电子书、公开版权小说等），存成本地 txt 即可 |
+
+> 不需要：FFmpeg（系统自带静态二进制 via imageio-ffmpeg）、向量数据库（FAISS 内嵌）、GPU（纯 CPU 可跑，所有推理在 MiniMax 云端）。
+
+### 1. 下载代码并安装依赖
 
 ```bash
-cd novel_pipeline
+git clone https://github.com/ysking-0-0/novel-agent.git
+cd novel-agent          # 项目根目录（即本仓库）
 pip install -r requirements.txt
 ```
 
-### 2. 配置 API Key
+依赖清单（requirements.txt）：`langchain-openai`、`langgraph`、`langgraph-checkpoint-sqlite`、`requests`、`Pillow`、`imageio-ffmpeg`、`faiss-cpu` 等。Python 3.11+。
 
-方式一：环境变量
+### 2. 配置 API Key（二选一）
+
+**方式一：环境变量（推荐，最简单）**
 ```bash
 export MINIMAX_API_KEY="sk-cp-你的真实key"
 ```
 
-方式二：配置文件（复制示例后修改）
+**方式二：配置文件（同时想改模型/音色/分辨率时用）**
 ```bash
 cp config.example.json config.json
-# 编辑 config.json 中的 api_key
 ```
+然后编辑 `config.json`，至少把 `model.api_key` 改成你的真实 key。config.json 已在 .gitignore 中，不会被提交。
 
-### 3. 准备小说文本
+> 还可在 config.json 里改：模型名（默认 MiniMax-M2.7-highspeed）、音色映射、视频分辨率（默认 1280x720）、目标集数等。详见下方「配置参数」表。
 
-将小说 TXT 文件放于任意路径，例如 `./data/novel.txt`。
+### 3. 放入小说文本
 
-### 4. 运行
+把你的小说 txt 放到任意位置，默认约定放 `./data/novel.txt`：
 
-全新运行（生成 10 集）：
 ```bash
-python main.py --novel ./data/novel.txt --target 10
+mkdir -p data
+cp /你的小说路径/某小说.txt data/novel.txt
 ```
 
-跑完全本：
+> 也支持放别处，运行时用 `--novel /你的路径.txt` 指定即可。文件越完整越好（几万字起步，百万字也行）；太短（<几千字）可能凑不够一集（系统要求每集至少 3 个场景）。
+
+### 4. 运行（一行命令出视频）
+
+**最简：生成 10 集视频**
 ```bash
-python main.py --novel ./data/novel.txt
+python main.py --novel ./data/novel.txt --target 10 --config config.json
 ```
 
-断点续跑（从上次中断处继续）：
-```bash
-python main.py --resume
-```
-
-自定义分片大小与重试上限：
-```bash
-python main.py --novel ./data/novel.txt --chunk-size 6000 --max-retries 3
-```
-
-使用配置文件覆盖：
+**跑完全本**（自动一直跑到小说末尾，生成 N 集）
 ```bash
 python main.py --novel ./data/novel.txt --config config.json
 ```
 
-### 5. 产出
+**断点续跑**（中断后从上次位置继续，不重复生成已完成的集）
+```bash
+python main.py --resume --config config.json
+```
 
-成品素材按单集独立目录归档：
+**用环境变量方式（不写 config.json）**
+```bash
+export MINIMAX_API_KEY="sk-cp-你的真实key"
+python main.py --novel ./data/novel.txt --target 5
+```
+
+> 运行过程中控制台会实时打印进度：`[生产]`/`[评审]`/`[归档]`/`[合成]`/`[进度] 已完成 N 集`。每集约需 3-8 分钟（取决于 LLM 响应和生图/TTS 并发）。
+
+### 5. 产出在哪里 & 各是什么
+
+成品按单集独立目录归档在 `output/` 下：
+
 ```
 output/
 ├ ep_001/
-│  ├ episode_info.json      # 单集基础信息、因果概述、关联伏笔
-│  ├ script.txt             # 整集讲解文案
-│  ├ image_prompts.json     # 时序化图片Prompt列表
-│  ├ tts_meta.json          # 整集TTS参数列表
-│  ├ original_snippet.txt   # 对应原著原文片段（备查）
-│  ├ images/                # 生成的每帧图片（001.png ...）
+│  ├ episode_info.json      # 单集基础信息（剧情概述/因果链/关联伏笔/评审结果）
+│  ├ script.txt             # 整集口播讲解文案（可直接朗读）
+│  ├ image_prompts.json     # 时序化图片 Prompt 列表（List[dict]）
+│  ├ tts_meta.json          # 整集 TTS 参数列表（每段：文本/音色/情绪/语速/停顿）
+│  ├ original_snippet.txt   # 对应的原著原文片段（备查/对照）
+│  ├ images/                # AI 生成的每帧图片（001.png ...）
 │  ├ audio/                 # 合成的每段语音（001.mp3 ...）
-│  └ ep_001.mp4             # 拼接后的讲解视频
+│  └ ep_001.mp4             # ★ 最终讲解视频（图片+语音拼接）
 ├ ep_002/
 └ ...
+memory/
+├ characters.json           # 全局人物档案库
+├ events.json               # 时序事件库
+├ foreshadows.json          # 伏笔台账
+└ character_portraits/      # 角色定妆照（跨集复用，保证人物一致）
+   ├ 钟岳.jpg
+   └ 薪火.jpg
+checkpoints/
+└ checkpoint.sqlite         # 断点快照（--resume 靠它续跑）
 ```
+
+**直接拿 `output/ep_XXX/ep_XXX.mp4` 就是成品视频**，可直接播放或在剪辑软件二次加工。
 
 ## 目录结构
 
@@ -316,8 +354,9 @@ novel_pipeline/
 |--------|----------|--------|------|
 | model.api_key | `MINIMAX_API_KEY` | - | MiniMax API Key |
 | model.base_url | `MINIMAX_BASE_URL` | `https://api.minimaxi.com/v1` | OpenAI 兼容端点 |
-| model.production_model | - | MiniMax-M3 | 生产/支撑层模型 |
-| model.review_model | - | MiniMax-M3 | 评审层模型 |
+| model.production_model | - | MiniMax-M2.7-highspeed | 生产/支撑层模型 |
+| model.review_model | - | MiniMax-M2.7-highspeed | 评审层模型 |
+| model.max_tokens | `MODEL_MAX_TOKENS` | 16384 | 单次响应 token 上限（material_generator 输出含完整 JSON，需较大值） |
 | run.chunk_size | `CHUNK_SIZE` | 8000 | 单次读取字符上限 |
 | run.target_episode_count | `TARGET_EPISODE_COUNT` | 0(全本) | 目标集数 |
 | run.max_retries | `MAX_RETRIES` | 2 | 单集最大重试（format + review 共享） |
@@ -333,18 +372,19 @@ novel_pipeline/
 | media.tts_concurrency | `TTS_CONCURRENCY` | 1 | TTS 并发数（限流敏感） |
 | media.video_resolution | `VIDEO_RESOLUTION` | 1280x720 | 视频分辨率 |
 | media.video_fps | `VIDEO_FPS` | 30 | 视频帧率 |
-| media.voice_mapping | - | 见 config.example.json | voice 字段 → MiniMax voice_id |
-| media.default_voice_id | `DEFAULT_VOICE_ID` | male-qn-jingying | 兜底音色 |
+| media.image_aspect_ratio | `IMAGE_ASPECT_RATIO` | 16:9 | 生图宽高比 |
+| media.voice_mapping | - | 见 config.example.json | voice 字段 → MiniMax voice_id（默认：narrator→Chinese_gravelly_storyteller_nv1，女性→Chinese (Mandarin)_Sweet_Lady，钟岳→Chinese_worker_male）|
+| media.default_voice_id | `DEFAULT_VOICE_ID` | Chinese_gravelly_storyteller_nv1 | 兜底音色 |
 
 ## 技术栈
 
 | 组件 | 选型 | 用途 |
 |------|------|------|
 | 调度框架 | LangGraph (StateGraph + SqliteSaver) | 状态机编排 + 断点续跑 |
-| LLM | MiniMax-M2.7-highspeed / M3（OpenAI 兼容协议） | 剧情/素材/评审 |
+| LLM | MiniMax-M2.7-highspeed（OpenAI 兼容协议） | 剧情/素材/评审 |
 | LLM 编排 | LangChain (langchain-openai) | ChatOpenAI 接入 |
-| 生图 | MiniMax `/v1/image_generation` (image-01) | AI 配图，带 reference_image 保持人物一致 |
-| 语音合成 | MiniMax `/v1/t2a_v2` (speech-02-hd) | TTS，hex 音频解码 |
+| 生图 | MiniMax `/v1/image_generation` (image-01) | AI 配图，中国古代神话风格，带 reference_image 保持人物一致 |
+| 语音合成 | MiniMax `/v1/t2a_v2` (speech-02-hd) | TTS，三音色映射（旁白/女性/男性），hex 音频解码 |
 | 视频合成 | imageio-ffmpeg（静态 ffmpeg 二进制） | 图片+音频→mp4 拼接 |
 | 向量检索 | FAISS (faiss-cpu) | 长线伏笔召回 |
 | 状态持久化 | SQLite (LangGraph Checkpointer) | 断点快照 |
@@ -360,8 +400,9 @@ novel_pipeline/
 - ✅ offset 字节游标分片 + 章节边界自动对齐
 - ✅ 适配推理模型的思维链输出，鲁棒 JSON 提取（extract_json_dict）
 - ✅ format 阶段死循环防护（超 max_retries 放行归档）
-- ✅ 多媒体合成闭环：定妆照参考 → AI 生图 → TTS → FFmpeg 视频拼接
-- ✅ 端到端实跑验证：ep_001 产出 7 图 + 7 段语音 + 2分38秒讲解视频 (5.6MB)
+- ✅ 多媒体合成闭环：定妆照参考 → AI 生图（中国古代神话风格）→ TTS（三音色映射）→ FFmpeg 视频拼接
+- ✅ 细粒度图片：每个场景/动作对应一张图（narration_segment 标注归属语音段），图片数 > 语音段数，同段多图均分音频时长展示
+- ✅ 端到端实跑验证：ep_001 产出 4 图 + 1 段语音 + 37.8 秒讲解视频 (1.9MB)
 
 ## 注意事项
 
