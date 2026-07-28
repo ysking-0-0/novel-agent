@@ -6,7 +6,7 @@
     "api_key": "sk-cp-xxxx 替换为你的真实 key",
     "base_url": "https://api.minimaxi.com/v1",
     "temperature": 0.3,
-    "max_tokens": 8192
+    "max_tokens": 16384
   },
   "run": {
     "novel_file_path": "./data/novel.txt",

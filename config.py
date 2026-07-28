@@ -25,7 +25,7 @@ class ModelConfig:
     api_key: str = os.getenv("MINIMAX_API_KEY", "")
     base_url: str = os.getenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
     temperature: float = float(os.getenv("MODEL_TEMPERATURE", "0.3"))
-    max_tokens: int = int(os.getenv("MODEL_MAX_TOKENS", "8192"))
+    max_tokens: int = int(os.getenv("MODEL_MAX_TOKENS", "16384"))
 
 
 @dataclass
@@ -83,20 +83,21 @@ class MediaConfig:
     # 视频帧率
     video_fps: int = int(os.getenv("VIDEO_FPS", "30"))
     # 角色音色映射：tts_meta.voice 值（角色名/旁白标识）→ MiniMax voice_id
-    # 可用 voice_id：male-qn-jingying(男精英) male-qn-badao(男霸道)
-    #   female-shaonv(女少女) female-chengshu(女成熟) female-tianmei(女甜美)
-    #   female-yujie(女御姐) presenter_male(男主持) presenter_female(女主持)
-    # 角色名直接映射；旁白用 narrator
+    # 可用 voice_id（MiniMax）：
+    #   Chinese_gravelly_storyteller_nv1（中文沉稳旁白/说书人，沙哑磁性）
+    #   Chinese (Mandarin)_Sweet_Lady（中文甜美女声）
+    #   male-qn-badao（男霸道，占位待替换）
+    # 旁白用 narrator，女性角色用 Sweet_Lady
     voice_mapping: dict = field(default_factory=lambda: {
-        "narrator": "male-qn-jingying",
-        "narrator_male": "male-qn-jingying",
-        "narrator_female": "female-shaonv",
+        "narrator": "Chinese_gravelly_storyteller_nv1",
+        "narrator_male": "Chinese_gravelly_storyteller_nv1",
+        "narrator_female": "Chinese (Mandarin)_Sweet_Lady",
         # 角色→音色（按需在此添加，角色名须与剧情解析一致）
-        "钟岳": "male-qn-badao",
-        "薪火": "female-yujie",
+        "钟岳": "Chinese_worker_male",
+        "薪火": "Chinese (Mandarin)_Sweet_Lady",
     })
     # 默认音色（voice_mapping 中找不到时用）
-    default_voice_id: str = os.getenv("DEFAULT_VOICE_ID", "male-qn-jingying")
+    default_voice_id: str = os.getenv("DEFAULT_VOICE_ID", "Chinese_gravelly_storyteller_nv1")
 
 
 @dataclass

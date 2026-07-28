@@ -12,12 +12,21 @@ from typing import Any, Optional
 
 def _find_last_json_block(text: str) -> Optional[str]:
     """从文本中提取最后一个 ```...``` 代码块内容（优先 json 标记）。"""
-    # 找所有 ``` 围栏块，取最后一个非空的
+    # 找所有完整 ``` 围栏块，取最后一个非空的
     blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text)
     for b in reversed(blocks):
         b = b.strip()
         if b:
             return b
+    # 处理只有开头 ```json 但无配对结束 fence 的情况（输出被截断）
+    # 从最后一个 ```json 之后取剩余内容作为候选
+    m = None
+    for m in re.finditer(r"```(?:json)?\s*", text):
+        pass
+    if m:
+        tail = text[m.end():].strip()
+        if tail and ('{' in tail or '[' in tail):
+            return tail
     return None
 
 

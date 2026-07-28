@@ -16,29 +16,40 @@ from llm_factory import get_llm
 from agents.memory_manager import get_memory_agent
 
 
-SYSTEM_PROMPT = """你是短视频多媒体素材生成专家。基于一集剧集（Episode）的剧情因果链，一次性生成三类素材，保证情绪、叙事视角统一。
+SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成专家。基于一集剧集（Episode）的剧情因果链，一次性生成三类素材，保证情绪、叙事视角统一。
 
-【核心对齐规则】image_prompts 与 tts_meta 必须 1:1 严格对齐：
-- 两者数量完全相同，index 从 1 起递增，一一对应
-- 每段 TTS 朗读文本对应恰好一张画面，语音说到什么场景就配什么图
-- 语音段落的分切以「画面切换时机」为准：剧情场景转换、情绪转折、新角色登场、关键道具出现 → 切到新画面
-- 不要一段语音配多张图，也不要一张图覆盖多段语音
+【画面风格要求（最高优先级）】
+所有生图 Prompt 必须以 'ancient Chinese mythology art style, ' 开头，整体风格为：
+- 中国古代神话风格，古朴、蛮荒、磅礴，具有洪荒神话感
+- 男性角色：英俊帅气，五官立体，身姿挺拔，气质不凡
+- 女性角色：美丽动人，容颜绝世，气质出尘
+- 服饰必须符合境界与身份：外门弟子着粗麻兽皮短打，内门弟子着素色道袍，长老着华贵锦袍佩玉，神族着古朴祭祀礼服
+- 发饰符合古风：束发玉冠、木簪、骨笄，不用现代发饰
+- 场景环境：崇山峻岭、幽谷深壑、上古遗迹，古朴蛮荒，磅礴大气，具有神话时代感
+- 光影：神秘古拙，多用幽光、灵气、神光，不用现代光源
+
+【图片粒度规则】
+- 每个场景动作对应一张图，细粒度拆分
+- 一个动作变化、场景转换、新角色登场、关键道具出现 → 单独一张图
+- 图片数量通常多于语音段落数量（一张图可能只展示一个瞬间动作）
+- image_prompts 的 index 独立递增，与 tts_meta 不要求数量相同
+- 但每个 image_prompt 必须标注 narration_segment：对应 tts_meta 的第几段（语音播放到该段时展示此图）
 
 【输出格式 严格 JSON】
 {
-  "script": "整集口语化讲解文案（纯文本，用『』分隔段落，每段对应一张画面）",
+  "script": "整集口语化讲解文案（纯文本，用『』分隔段落，每段对应一个叙事单元）",
   "image_prompts": [
     {
       "index": 1,
-      "segment": "对应 script 中第几个段落",
-      "prompt": "动漫风格生图Prompt，必须包含：(1) 'anime style'风格前缀 (2) 人物外貌（严格沿用人物档案，发色/发型/服装/体型）(3) 精确动作与表情 (4) 场景环境细节 (5) 关键视觉特征必须明确写出（如四翼金鸟必须写'four-winged golden bird with four wings spread'，不可只写'bird'）(6) 光影氛围匹配情绪 (7) 镜头构图",
+      "narration_segment": "对应 tts_meta 的第几段（整数，语音播放到该段时展示此图）",
+      "prompt": "以 'ancient Chinese mythology art style, ' 开头的生图Prompt，必须包含：(1) 风格前缀 (2) 人物外貌（英俊帅气/美丽动人，发色发型发饰，服饰须符合境界身份）(3) 精确动作与表情 (4) 场景环境（古朴蛮荒磅礴）(5) 关键视觉特征精确写出（四翼金鸟必须写'four-winged golden bird with four distinct wings spread'，不可只写'bird'）(6) 神话氛围光影 (7) 镜头构图",
       "mood": "本画面情绪关键词"
     }
   ],
   "tts_meta": [
     {
       "index": 1,
-      "text": "本段朗读文本（从 script 切分，与同 index 的 image_prompt 画面一一对应）",
+      "text": "本段朗读文本（从 script 切分）",
       "voice": "角色名（如钟岳、薪火、narrator），旁白用 narrator",
       "emotion": "情绪：neutral | excited | sad | tense | calm | angry | surprised",
       "speed": "语速 0.8-1.2 浮点",
@@ -50,11 +61,12 @@ SYSTEM_PROMPT = """你是短视频多媒体素材生成专家。基于一集剧�
 严格要求：
 1. 讲解文案必须清晰交代本集的因果链与伏笔，不要遗漏关键事实
 2. 生图 Prompt 中人物外貌必须100%沿用给定的人物档案，不得擅自改变设定
-3. 生图 Prompt 必须以 'anime style, ' 开头，整体画面为日式动漫风格
-4. 关键视觉特征必须精确描述：怪物的形态（几翼/几首/几尾）、武器外形、特殊道具、环境特征（黑霾/幽谷/火树），不可用模糊词如'bird''monster''weapon'替代
-5. 光影氛围必须匹配该段落剧情情绪（紧张→冷暗色调、温馨→暖亮色调、战斗→高对比）
-6. image_prompts 的 index 与 tts_meta 的 index 必须完全一致，数量相同
-7. 不得新增剧情、不得篡改事实，文案是对原文的口语化转述"""
+3. 生图 Prompt 必须以 'ancient Chinese mythology art style, ' 开头
+4. 人物必须英俊帅气（男）/美丽动人（女），服饰符合境界身份，发饰古风
+5. 关键视觉特征必须精确描述：怪物的形态（几翼/几首/几尾）、武器外形、特殊道具、环境特征，不可用模糊词
+6. 每个动作/场景转换对应一张图，图片粒度要细，数量通常多于语音段落
+7. 每个 image_prompt 必须有 narration_segment 标注对应 tts_meta 的第几段
+8. 不得新增剧情、不得篡改事实，文案是对原文的口语化转述"""
 
 
 class MaterialGeneratorAgent:
@@ -119,13 +131,26 @@ class MaterialGeneratorAgent:
         from utils import extract_json_dict
         data = extract_json_dict(content)
         if isinstance(data, dict):
-            # 规范化 image_prompts 为 List[str]
+            # 规范化 image_prompts 为 List[dict]，每个含 prompt + narration_segment
             if isinstance(data.get("image_prompts"), list):
-                data["image_prompts"] = [
-                    p.get("prompt", json.dumps(p, ensure_ascii=False))
-                    if isinstance(p, dict) else str(p)
-                    for p in data["image_prompts"]
-                ]
+                normalized = []
+                for p in data["image_prompts"]:
+                    if isinstance(p, dict):
+                        prompt_text = p.get("prompt", "")
+                        narr_seg = p.get("narration_segment") or p.get("segment")
+                        # narration_segment 转整数（对应 tts_meta.index）
+                        try:
+                            narr_seg = int(narr_seg) if narr_seg is not None else None
+                        except (ValueError, TypeError):
+                            narr_seg = None
+                        normalized.append({
+                            "prompt": prompt_text,
+                            "narration_segment": narr_seg,
+                            "mood": p.get("mood", ""),
+                        })
+                    else:
+                        normalized.append({"prompt": str(p), "narration_segment": None, "mood": ""})
+                data["image_prompts"] = normalized
             return data
         # 兜底
         return {

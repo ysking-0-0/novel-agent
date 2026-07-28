@@ -119,9 +119,12 @@ def get_or_create_portrait(char_id: str, appearance_desc: str) -> Optional[str]:
         return path
 
     portrait_prompt = (
-        "anime style, character reference portrait, front view, neutral background, full face visible. "
+        "ancient Chinese mythology art style, character reference portrait, front view, "
+        "neutral background, full face visible. "
         + (appearance_desc or char_id)
-        + ". Clean lighting, high detail, consistent anime character design sheet."
+        + ". Handsome and heroic if male, beautiful and ethereal if female. "
+        "Ancient Chinese attire matching cultivation realm, jade hairpin or topknot. "
+        "Mystical atmosphere, high detail, consistent character design sheet."
     )
     print("    [定妆照] 首次生成 %s" % char_id)
     url = _call_image_api(portrait_prompt, reference_image_b64=None)
@@ -183,7 +186,9 @@ def generate_images(episode: Dict, prompts: List[str], ep_dir: str) -> List[Opti
 
     def _one(idx_prompt):
         idx, prompt = idx_prompt
-        url = _call_image_api(prompt, reference_image_b64=primary_ref_b64)
+        # 支持 dict（含 prompt + narration_segment）或纯 str
+        prompt_text = prompt.get("prompt") if isinstance(prompt, dict) else str(prompt)
+        url = _call_image_api(prompt_text, reference_image_b64=primary_ref_b64)
         if not url:
             return idx, None
         dest = os.path.join(img_dir, "%03d.png" % idx)
@@ -409,8 +414,13 @@ def _audio_duration(path: str) -> float:
 
 
 def _make_clip(image_path: Optional[str], audio_path: Optional[str],
-               idx: int, tmp_dir: str, resolution: str, fps: int) -> Optional[str]:
-    """单张图片 + 单段音频合成片段 mp4。"""
+               idx: int, tmp_dir: str, resolution: str, fps: int,
+               duration: float = None, audio_seek: float = 0) -> Optional[str]:
+    """单张图片 + 音频片段合成片段 mp4。
+
+    duration: 指定片段时长（用于同段音频内多图均分）。
+    audio_seek: 音频起始偏移（秒），用于同段音频内多图切片。
+    """
     exe = _ffmpeg_path()
     out = os.path.join(tmp_dir, "clip_%03d.mp4" % idx)
 
@@ -431,13 +441,19 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
 
     # 音频输入与时长
     if audio_path and os.path.exists(audio_path):
-        aud_arg = ["-i", audio_path]
-        dur = _audio_duration(audio_path)
-        extra = ["-shortest"]
+        # 支持 seek 偏移（同段音频多图切片）
+        seek_arg = ["-ss", "%.2f" % audio_seek] if audio_seek > 0 else []
+        aud_arg = seek_arg + ["-i", audio_path]
+        if duration is not None:
+            dur = duration
+            extra = ["-t", "%.2f" % dur]
+        else:
+            dur = _audio_duration(audio_path)
+            extra = ["-shortest"]
     else:
-        aud_arg = ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=24000", "-t", "3"]
-        dur = 3.0
-        extra = []
+        aud_arg = ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=24000"]
+        dur = duration if duration is not None else 3.0
+        extra = ["-t", "%.2f" % dur]
 
     w, h = resolution.split("x")
     vf = "scale=%s:%s:force_original_aspect_ratio=decrease,pad=%s:%s:(ow-iw)/2:(oh-ih)/2:black,fps=%d" % (w, h, w, h, fps)
@@ -455,8 +471,14 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
 
 
 def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[str]],
-                  tts_meta: List[Dict], ep_dir: str, eid: str) -> Optional[str]:
-    """按 tts_meta 时序拼接片段 → 完整 episode.mp4。"""
+                  tts_meta: List[Dict], ep_dir: str, eid: str,
+                  image_prompts: List = None) -> Optional[str]:
+    """按 tts_meta 时序拼接片段 → 完整 episode.mp4。
+
+    支持细粒度图片：image_prompts 可能多于 tts_meta，
+    每个 image_prompt 的 narration_segment 标注对应第几段语音（1-based）。
+    同一语音段内的多张图按音频时长均分展示。
+    """
     if not image_paths and not audio_paths:
         return None
 
@@ -464,14 +486,46 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
     tmp_dir = os.path.join(ep_dir, "_tmp_clips")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    n = max(len(image_paths), len(audio_paths))
+    # 按 narration_segment 分组图片到对应语音段
+    # narration_segment 是 1-based（对应 tts_meta index）
+    seg_images: Dict[int, List[Optional[str]]] = {}  # segment(1-based) -> [image_path]
+    for i, img_path in enumerate(image_paths):
+        narr_seg = None
+        if image_prompts and i < len(image_prompts):
+            p = image_prompts[i]
+            narr_seg = p.get("narration_segment") if isinstance(p, dict) else None
+        # 没有 narration_segment 的图，按 index 顺序分配（回退：分到第 i+1 段或最后一段）
+        if narr_seg is None:
+            narr_seg = min(i + 1, len(tts_meta)) if tts_meta else 1
+        seg_images.setdefault(narr_seg, []).append(img_path)
+
     clips: List[str] = []
-    for i in range(n):
-        img = image_paths[i] if i < len(image_paths) else None
-        aud = audio_paths[i] if i < len(audio_paths) else None
-        clip = _make_clip(img, aud, i, tmp_dir, cfg.media.video_resolution, cfg.media.video_fps)
-        if clip:
-            clips.append(clip)
+    clip_idx = 0
+    # 遍历每段语音
+    for seg_idx in range(len(tts_meta)):
+        seg_no = seg_idx + 1  # 1-based
+        aud = audio_paths[seg_idx] if seg_idx < len(audio_paths) else None
+        # 该段的图片列表
+        imgs = seg_images.get(seg_no, [])
+        if not imgs:
+            # 无图，用占位
+            imgs = [None]
+        # 音频时长
+        if aud and os.path.exists(aud):
+            seg_dur = _audio_duration(aud)
+        else:
+            seg_dur = 3.0
+        # 均分时长给每张图，每张图取音频的对应片段
+        per_img = seg_dur / len(imgs)
+        seek_acc = 0.0
+        for img in imgs:
+            clip = _make_clip(img, aud, clip_idx, tmp_dir,
+                              cfg.media.video_resolution, cfg.media.video_fps,
+                              duration=per_img, audio_seek=seek_acc)
+            if clip:
+                clips.append(clip)
+            clip_idx += 1
+            seek_acc += per_img
 
     if not clips:
         print("    [视频] 无可用片段")
@@ -559,7 +613,8 @@ def media_synthesizer_node(state: Dict) -> Dict:
         audio_paths = []
 
     print("  [阶段3] 拼接视频...")
-    video_path = compose_video(image_paths, audio_paths, tts_meta, ep_dir, eid)
+    video_path = compose_video(image_paths, audio_paths, tts_meta, ep_dir, eid,
+                               image_prompts=prompts)
 
     if video_path:
         sz_mb = os.path.getsize(video_path) / (1024 * 1024)

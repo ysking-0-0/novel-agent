@@ -44,12 +44,15 @@ def format_validator_node(state: Dict) -> Dict:
     if not script.strip():
         errors.append("episode_script 为空")
 
-    # 4. image_prompts 非空列表
+    # 4. image_prompts 非空列表（支持 List[str] 或 List[dict]）
     if not isinstance(image_prompts, list) or len(image_prompts) == 0:
         errors.append("episode_image_prompts 为空")
     else:
         for i, p in enumerate(image_prompts):
-            if not isinstance(p, str) or not p.strip():
+            if isinstance(p, dict):
+                if not p.get("prompt") or not str(p["prompt"]).strip():
+                    errors.append(f"image_prompt[{i}] prompt 为空")
+            elif not isinstance(p, str) or not p.strip():
                 errors.append(f"image_prompt[{i}] 非字符串或为空")
 
     # 5. tts_meta 非空列表且字段齐全
