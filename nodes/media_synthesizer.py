@@ -609,13 +609,15 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
         print("    [视频] concat 拼接失败")
         return None
 
-    # 第二步：混入 BGM（amix + volume）→ 最终输出
+    # 第二步：混入 BGM（循环播放 + volume）→ 最终输出
+    # BGM 用 stream_loop=-1 无限循环，duration=first 对齐视频时长，视频在BGM就继续放
     cfg = get_config()
     bgm = cfg.media.bgm_path
     if bgm and os.path.exists(bgm):
         try:
             subprocess.run(
-                [exe, "-y", "-i", concat_out, "-i", bgm,
+                [exe, "-y", "-i", concat_out,
+                 "-stream_loop", "-1", "-i", bgm,
                  "-filter_complex",
                  "[1:a]volume=%.2f[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]" % cfg.media.bgm_volume,
                  "-map", "0:v", "-map", "[a]",
@@ -623,9 +625,10 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
                 capture_output=True, timeout=600,
             )
             if not (os.path.exists(out) and os.path.getsize(out) > 1000):
-                # amix copy v 失败，重编码视频
+                # copy v 失败，重编码视频
                 subprocess.run(
-                    [exe, "-y", "-i", concat_out, "-i", bgm,
+                    [exe, "-y", "-i", concat_out,
+                     "-stream_loop", "-1", "-i", bgm,
                      "-filter_complex",
                      "[1:a]volume=%.2f[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]" % cfg.media.bgm_volume,
                      "-map", "0:v", "-map", "[a]",
