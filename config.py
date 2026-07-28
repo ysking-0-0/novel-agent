@@ -3,10 +3,11 @@ novel_pipeline.config
 全局配置：模型参数、分片大小、目标集数、路径、重试上限等。
 通过环境变量覆盖，便于不同部署环境。
 
-配置分三组：
+配置分四组：
   model   —— LLM 绑定（生产/评审/支撑三层模型）
   run     —— 运行参数（分片大小、重试上限、目标集数）
   storage —— 存储路径（sqlite 断点、成品目录、记忆库、向量库开关）
+  media   —— 多媒体合成（生图/TTS/视频拼接参数）
 """
 import os
 import json
@@ -61,10 +62,44 @@ class StorageConfig:
 
 
 @dataclass
+class MediaConfig:
+    """多媒体合成配置：生图/TTS/视频拼接。"""
+    # 是否启用合成阶段（persistence 后自动触发生图+TTS+视频）
+    enable_synthesis: bool = (
+        os.getenv("ENABLE_SYNTHESIS", "true").lower() == "true"
+    )
+    # 生图并发数（MiniMax 限流未知，保守默认 3）
+    image_concurrency: int = int(os.getenv("IMAGE_CONCURRENCY", "3"))
+    # TTS 并发数（MiniMax TTS 并发限流敏感，默认串行=1）
+    tts_concurrency: int = int(os.getenv("TTS_CONCURRENCY", "1"))
+    # 生图模型
+    image_model: str = os.getenv("IMAGE_MODEL", "image-01")
+    # TTS 模型
+    tts_model: str = os.getenv("TTS_MODEL", "speech-02-hd")
+    # 图片宽高比
+    image_aspect_ratio: str = os.getenv("IMAGE_ASPECT_RATIO", "16:9")
+    # 视频分辨率（与图片比例匹配）
+    video_resolution: str = os.getenv("VIDEO_RESOLUTION", "1280x720")
+    # 视频帧率
+    video_fps: int = int(os.getenv("VIDEO_FPS", "30"))
+    # 角色音色映射：tts_meta.voice 值 → MiniMax voice_id
+    # narrartor_male 等占位值映射到具体音色
+    voice_mapping: dict = field(default_factory=lambda: {
+        "narrator_male": "male-qn-jingying",
+        "narrator_female": "female-shaonv",
+        "character_male": "male-qn-badao",
+        "character_female": "female-shaonv",
+    })
+    # 默认音色（voice_mapping 中找不到时用）
+    default_voice_id: str = os.getenv("DEFAULT_VOICE_ID", "male-qn-jingying")
+
+
+@dataclass
 class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     run: RunConfig = field(default_factory=RunConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    media: MediaConfig = field(default_factory=MediaConfig)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -117,6 +152,10 @@ def set_config(config_file: Optional[str] = None) -> Config:
             for k, v in data["storage"].items():
                 if hasattr(cfg.storage, k):
                     setattr(cfg.storage, k, v)
+        if "media" in data:
+            for k, v in data["media"].items():
+                if hasattr(cfg.media, k):
+                    setattr(cfg.media, k, v)
     # 覆盖后仍无 key 才报错
     if not cfg.model.api_key:
         raise RuntimeError(

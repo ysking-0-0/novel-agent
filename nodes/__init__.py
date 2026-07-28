@@ -10,6 +10,7 @@ from .routing import (
     route_after_chunking,
 )
 from .retry_counter import retry_counter_node
+from .media_synthesizer import media_synthesizer_node
 
 __all__ = [
     "text_chunker_node",
@@ -22,4 +23,5 @@ __all__ = [
     "route_after_persistence",
     "route_after_chunking",
     "retry_counter_node",
+    "media_synthesizer_node",
 ]

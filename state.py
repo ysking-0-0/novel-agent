@@ -60,6 +60,10 @@ class NovelState(TypedDict, total=False):
     # 人工复核标记（重试超限仍不通过）
     needs_human_review: bool
 
+    # ───────── 多媒体合成（media_synthesizer 产出） ─────────
+    # 本集合成视频的本地路径（合成失败为 None）
+    video_path: Optional[str]
+
 
 def initial_state(file_path: str,
                   chunk_size: int = 8000,

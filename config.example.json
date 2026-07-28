@@ -22,5 +22,22 @@
     "memory_dir": "./memory",
     "enable_vector_retrieval": true,
     "vector_dim": 1536
+  },
+  "media": {
+    "enable_synthesis": true,
+    "image_concurrency": 3,
+    "tts_concurrency": 1,
+    "image_model": "image-01",
+    "tts_model": "speech-02-hd",
+    "image_aspect_ratio": "16:9",
+    "video_resolution": "1280x720",
+    "video_fps": 30,
+    "voice_mapping": {
+      "narrator_male": "male-qn-jingying",
+      "narrator_female": "female-shaonv",
+      "character_male": "male-qn-badao",
+      "character_female": "female-shaonv"
+    },
+    "default_voice_id": "male-qn-jingying"
   }
 }

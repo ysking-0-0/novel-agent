@@ -29,7 +29,7 @@ from agents import (
 )
 from nodes import (
     text_chunker_node, format_validator_node, memory_prefetch_node,
-    persistence_node, retry_counter_node,
+    persistence_node, retry_counter_node, media_synthesizer_node,
     route_after_aggregation, route_after_format_check,
     route_after_arbiter, route_after_persistence, route_after_chunking,
 )
@@ -103,6 +103,7 @@ def build_graph(db_path: str = None):
     g.add_node("review_arbiter", _wrap(ReviewArbiterAgent().invoke))
     g.add_node("retry_counter", retry_counter_node)
     g.add_node("persistence", persistence_node)
+    g.add_node("media_synthesizer", media_synthesizer_node)
 
     # ---------- 入口 ----------
     g.add_edge(START, "text_chunker")
@@ -168,9 +169,10 @@ def build_graph(db_path: str = None):
     # retry_counter → material_generator（整集重生成）
     g.add_edge("retry_counter", "material_generator")
 
-    # persistence → 条件路由（终止判断）
+    # persistence → media_synthesizer → 条件路由（终止判断）
+    g.add_edge("persistence", "media_synthesizer")
     g.add_conditional_edges(
-        "persistence",
+        "media_synthesizer",
         route_after_persistence,
         {
             "text_chunker": "text_chunker",
