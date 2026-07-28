@@ -20,9 +20,14 @@ def route_after_aggregation(state: Dict) -> str:
 
 # ---------- 步骤 5：格式校验后路由 ----------
 def route_after_format_check(state: Dict) -> str:
-    """格式正确 → 进入记忆预检索；错误 → 回到素材生成局部修正。"""
+    """格式正确 → 进入记忆预检索；错误未超限 → 回素材生成局部修正；错误且超限 → 直送持久化（带人工复核）。"""
     if state.get("format_valid"):
         return "memory_prefetch"
+    retry = state.get("retry_count", 0)
+    max_retry = get_config().run.max_retries
+    if retry >= max_retry:
+        print(f"[路由] 格式校验超限({retry}>={max_retry})，直送归档（人工复核）")
+        return "persistence"
     return "material_generator"   # 局部修正重生成
 
 

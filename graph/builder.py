@@ -144,6 +144,7 @@ def build_graph(db_path: str = None):
         {
             "memory_prefetch": "memory_prefetch",
             "material_generator": "material_generator",
+            "persistence": "persistence",
         },
     )
 

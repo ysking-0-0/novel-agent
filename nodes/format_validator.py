@@ -6,9 +6,11 @@ novel_pipeline.nodes.format_validator
 职责：
   校验三类产出的 JSON 结构、字段完整性、ID 规范性
   格式错误返回步骤 4 局部修正
+  超过 max_retries 仍不通过 → 标记 manual_review 后放行归档（防止死循环）
 """
 from typing import Dict
 from state import NovelState
+from config import get_config
 
 
 REQUIRED_EPISODE_FIELDS = ["scenes", "summary", "cliffhanger"]
@@ -60,7 +62,24 @@ def format_validator_node(state: Dict) -> Dict:
                     errors.append(f"tts_meta[{i}] 缺失字段: {f}")
 
     valid = len(errors) == 0
-    return {
+    retry = state.get("retry_count", 0)
+    max_retry = get_config().run.max_retries
+    update: Dict = {
         "format_valid": valid,
         "format_errors": errors,
     }
+    if not valid:
+        if retry < max_retry:
+            # 未超限：递增计数，回 material_generator 局部修正
+            retry += 1
+            update["retry_count"] = retry
+            print(f"[格式] 校验失败（{retry}/{max_retry}），回素材生成修正")
+        else:
+            # 超限：标记人工复核，由路由直送 persistence 归档（绕过 review）
+            print(f"[格式] 重试超限({retry}>={max_retry})，标记人工复核后归档")
+            rr = state.get("review_result") or {}
+            rr["manual_review"] = True
+            rr["manual_review_reason"] = "format_check_exhausted"
+            rr["format_errors"] = errors
+            update["review_result"] = rr
+    return update

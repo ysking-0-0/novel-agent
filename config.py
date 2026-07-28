@@ -98,7 +98,9 @@ def set_config(config_file: Optional[str] = None) -> Config:
         config_file: 配置文件路径（.json）。None 则重新从环境变量加载。
     """
     global _global_config
-    cfg = load_config()
+    # 直接构造默认配置，不走 load_config() 的 key 校验
+    # （key 由配置文件提供时，环境变量可能为空，不应在此抛错）
+    cfg = Config()
     if config_file and os.path.exists(config_file):
         with open(config_file, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -115,5 +117,10 @@ def set_config(config_file: Optional[str] = None) -> Config:
             for k, v in data["storage"].items():
                 if hasattr(cfg.storage, k):
                     setattr(cfg.storage, k, v)
+    # 覆盖后仍无 key 才报错
+    if not cfg.model.api_key:
+        raise RuntimeError(
+            "未检测到 MINIMAX_API_KEY，请设置环境变量或在配置文件 model.api_key 中填写。"
+        )
     _global_config = cfg
     return cfg

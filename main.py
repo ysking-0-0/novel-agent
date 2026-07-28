@@ -152,7 +152,9 @@ def main():
     parser.add_argument("--max-retries", type=int, default=None, help="单集最大重试次数")
     args = parser.parse_args()
 
-    # 命令行参数覆盖配置
+    # 先加载配置文件（设置 api_key 等），再读全局配置
+    if args.config and os.path.exists(args.config):
+        set_config(args.config)
     cfg = get_config()
     if args.chunk_size:
         cfg.run.chunk_size = args.chunk_size
