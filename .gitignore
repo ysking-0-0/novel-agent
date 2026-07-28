@@ -10,6 +10,12 @@ data/
 # 含 API Key 的本地配置（不入库）
 config.json
 
+# BGM 等大体积媒体素材（不入库，本地放置）
+assets/*.mp3
+assets/*.wav
+assets/*.flac
+assets/*.m4a
+
 # 日志与临时文件
 *.log
 run.log

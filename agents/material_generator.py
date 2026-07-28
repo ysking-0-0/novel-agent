@@ -29,11 +29,14 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
 - 光影：神秘古拙，多用幽光、灵气、神光，不用现代光源
 
 【图片粒度规则】
-- 每个场景动作对应一张图，细粒度拆分
-- 一个动作变化、场景转换、新角色登场、关键道具出现 → 单独一张图
-- 图片数量通常多于语音段落数量（一张图可能只展示一个瞬间动作）
+- 目标节奏：每幅图展示约10秒（image_duration_target=10秒）
+- 拆图原则：一两句描述同一场景/动作的画面为一幅图；当描述切换到新场景/新动作/新视角时，换下一幅图
+- 参考范例（『生图频率描述.txt』节选）：
+  "钟岳攀上巨石采摘五香芝（图1），忽然一阵戾啸破空袭来，只见一只四翼金鸟展开四只金色羽翅俯冲扑击（图2）！钟岳临危不乱，抄起几株五香芝纵身跃下巨石（图3）。千钧一发之际，他双手死死抓住崖壁青藤，悬于巨石下方一丈处。四翼金鸟扑了个空（图4），戾啸着冲天而起（图5），在空中盘旋蓄势，准备发动第二次攻击（图6）。钟岳咬紧牙关，沿着青藤飞速向深谷滑去（图7）"
+  ——7幅图覆盖约70秒讲解，每图约10秒
+- 估算数量：全集语音总时长 / 10秒 ≈ 图片张数。如全集约90秒讲解 → 约9张图
 - image_prompts 的 index 独立递增，与 tts_meta 不要求数量相同
-- 但每个 image_prompt 必须标注 narration_segment：对应 tts_meta 的第几段（语音播放到该段时展示此图）
+- 每个 image_prompt 必须标注 narration_segment：对应 tts_meta 的第几段（语音播放到该段时展示此图）
 
 【输出格式 严格 JSON】
 {
@@ -64,7 +67,7 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
 3. 生图 Prompt 必须以 'ancient Chinese mythology art style, ' 开头
 4. 人物必须英俊帅气（男）/美丽动人（女），服饰符合境界身份，发饰古风
 5. 关键视觉特征必须精确描述：怪物的形态（几翼/几首/几尾）、武器外形、特殊道具、环境特征，不可用模糊词
-6. 每个动作/场景转换对应一张图，图片粒度要细，数量通常多于语音段落
+6. 图片粒度：每幅约10秒，一两句同一场景描述为一幅，场景/动作切换换下一幅（数量≈语音总时长/10秒）
 7. 每个 image_prompt 必须有 narration_segment 标注对应 tts_meta 的第几段
 8. 不得新增剧情、不得篡改事实，文案是对原文的口语化转述"""
 
@@ -111,6 +114,8 @@ class MaterialGeneratorAgent:
 
     def _build_user_msg(self, episode: Dict, char_profiles: List[Dict],
                         revise_instruction: Optional[Dict]) -> str:
+        from config import get_config
+        cfg = get_config().media
         scenes_text = json.dumps(episode.get("scenes", []), ensure_ascii=False, indent=2)
         char_text = json.dumps(char_profiles, ensure_ascii=False, indent=2) if char_profiles else "（暂无人物档案，请从剧情中提取外貌并保持一致）"
         revise_text = ""
@@ -124,6 +129,11 @@ class MaterialGeneratorAgent:
 
 【全局人物设定档案（生图Prompt必须严格沿用）】
 {char_text}{revise_text}
+
+【图片节奏参数】
+- 目标每图展示时长：{cfg.image_duration_target}秒
+- 估算图片张数 ≈ 语音总时长 / {cfg.image_duration_target}秒
+- BGM 背景音乐：{'已配置（' + cfg.bgm_path + '），音量' + str(int(cfg.bgm_volume*100)) + '%'}（如适用）
 
 请生成三类素材，输出 JSON。"""
 

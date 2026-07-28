@@ -39,6 +39,9 @@
       "钟岳": "Chinese_worker_male",
       "薪火": "Chinese (Mandarin)_Sweet_Lady"
     },
-    "default_voice_id": "Chinese_gravelly_storyteller_nv1"
+    "default_voice_id": "Chinese_gravelly_storyteller_nv1",
+    "image_duration_target": 10.0,
+    "bgm_path": "./assets/bgm.mp3",
+    "bgm_volume": 0.15
   }
 }

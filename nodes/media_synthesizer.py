@@ -539,24 +539,64 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
 
     out = os.path.join(ep_dir, "%s.mp4" % eid)
     exe = _ffmpeg_path()
-    # 先尝试 stream copy（快）
+    # 第一步：concat 拼接（可能 stream copy 或重编码）→ 临时文件
+    concat_out = os.path.join(tmp_dir, "concat.mp4")
+    concat_ok = False
     try:
         subprocess.run(
-            [exe, "-y", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", out],
+            [exe, "-y", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", concat_out],
             capture_output=True, timeout=300,
         )
+        if os.path.exists(concat_out) and os.path.getsize(concat_out) > 1000:
+            concat_ok = True
     except Exception as e:
         print("    [视频] stream copy 失败: %s，尝试重编码" % e)
-    if not (os.path.exists(out) and os.path.getsize(out) > 1000):
-        # stream copy 失败 → 重编码
+    if not concat_ok:
         try:
             subprocess.run(
                 [exe, "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
-                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", out],
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", concat_out],
                 capture_output=True, timeout=600,
             )
+            if os.path.exists(concat_out) and os.path.getsize(concat_out) > 1000:
+                concat_ok = True
         except Exception as e2:
             print("    [视频] 重编码也失败: %s" % e2)
+
+    if not concat_ok:
+        print("    [视频] concat 拼接失败")
+        return None
+
+    # 第二步：混入 BGM（amix + volume）→ 最终输出
+    cfg = get_config()
+    bgm = cfg.media.bgm_path
+    if bgm and os.path.exists(bgm):
+        try:
+            subprocess.run(
+                [exe, "-y", "-i", concat_out, "-i", bgm,
+                 "-filter_complex",
+                 "[1:a]volume=%.2f[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]" % cfg.media.bgm_volume,
+                 "-map", "0:v", "-map", "[a]",
+                 "-c:v", "copy", "-c:a", "aac", "-shortest", out],
+                capture_output=True, timeout=600,
+            )
+            if not (os.path.exists(out) and os.path.getsize(out) > 1000):
+                # amix copy v 失败，重编码视频
+                subprocess.run(
+                    [exe, "-y", "-i", concat_out, "-i", bgm,
+                     "-filter_complex",
+                     "[1:a]volume=%.2f[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]" % cfg.media.bgm_volume,
+                     "-map", "0:v", "-map", "[a]",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out],
+                    capture_output=True, timeout=600,
+                )
+        except Exception as e:
+            print("    [视频] BGM 混入失败: %s，用无BGM版本" % e)
+            import shutil as _sh
+            _sh.copy(concat_out, out)
+    else:
+        import shutil as _sh
+        _sh.copy(concat_out, out)
 
     # 清理临时片段
     try:
