@@ -110,26 +110,47 @@ def _ensure_portrait_dir() -> str:
     return d
 
 
-def get_or_create_portrait(char_id: str, appearance_desc: str) -> Optional[str]:
-    """获取或生成人物定妆照路径。已存在则复用，否则生成并落盘。"""
+def get_or_create_portrait(char_id: str, appearance_desc: str, entity_type: str = "human") -> Optional[str]:
+    """获取或生成人物定妆照路径。已存在则复用，否则生成并落盘。
+
+    entity_type: "human" 走古风人物约束；"spirit" 走火焰灵体特殊画法（如薪火）。
+    """
     d = _ensure_portrait_dir()
     safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in char_id)
     path = os.path.join(d, safe_id + ".jpg")
     if os.path.exists(path) and os.path.getsize(path) > 1000:
         return path
 
-    portrait_prompt = (
-        "ancient Chinese mythology art style, character reference portrait, front view, "
-        "neutral background, full body visible. "
-        + (appearance_desc or char_id)
-        + ". Handsome and heroic if male, beautiful and ethereal if female. "
-        "Ancient Chinese attire matching cultivation realm. "
-        "HAIR (ABSOLUTE MANDATORY): long black hair in ancient Chinese style, topknot or bun tied with jade hairpin or wooden hairpin or bone hairpin, "
-        "hair must be LONG and tied up, ABSOLUTELY NEVER modern short hair, NEVER modern hairstyle, NEVER buzz cut, NEVER side part, NEVER any modern haircut. "
-        "AGE LOCK: the character's apparent age must strictly match the age specified above, NEVER depict as older or younger. "
-        "Mystical atmosphere, high detail, consistent character design reference sheet for image-to-image continuity."
-    )
-    print("    [定妆照] 首次生成 %s" % char_id)
+    if entity_type == "spirit":
+        # 灵体/火焰化身（如薪火）：本体是火焰，特殊画法，不走古风服饰约束
+        portrait_prompt = (
+            "ancient Chinese mythology art style, spirit entity reference portrait, front view, "
+            "neutral dark background. "
+            + (appearance_desc or char_id)
+            + ". "
+            "FIRE SPIRIT FORM (MANDATORY): the character is a living flame spirit, body made of living fire, "
+            "hair made of flames, skin has ethereal glow, surrounded by fire aura, semi-transparent flame body, "
+            "dwelling in or emerging from a bronze lamp wick. "
+            "The entity MUST look like a flame-made small child figure with visible fire elements - "
+            "glowing flame hair, fire aura around body, semi-transparent or fiery edges, NOT a normal flesh child. "
+            "NO ancient Chinese clothing, NO hairpin, NO normal skin - the body is made of fire. "
+            "Mystical atmosphere, high detail, consistent character design reference sheet for image-to-image continuity."
+        )
+    else:
+        portrait_prompt = (
+            "ancient Chinese mythology art style, character reference portrait, front view, "
+            "neutral background, full body visible. "
+            + (appearance_desc or char_id)
+            + ". Handsome and heroic if male, beautiful and ethereal if female. "
+            "Ancient Chinese attire matching cultivation realm. "
+            "CLOTHING (ABSOLUTE MANDATORY): 100% ancient Chinese garments only - cross-collar right-lapel robes, wide sleeves, sash-waisted, multi-layered hanfu-style robes, fabric of hemp/silk/brocade/animal hide. ABSOLUTELY NEVER modern T-shirt, shirt, trousers, skirt, zipper, buttons, modern prints. "
+            "FOOTWEAR (MANDATORY): cloth shoes, straw sandals, leather boots, cloud-toe shoes only. ABSOLUTELY NEVER sneakers, leather shoes, modern shoes. "
+            "ACCESSORIES: jade pendant, bone carving, bronze ring, spirit stone pendant only. ABSOLUTELY NEVER watch, glasses, modern jewelry. "
+            "HAIR (ABSOLUTE MANDATORY): long black hair in ancient Chinese style, hair must be LONG and TIED UP into a visible topknot bun or coiled bun secured with jade hairpin or wooden hairpin or bone hairpin. The word 'bun' or 'topknot' MUST appear in the hairstyle description. ABSOLUTELY NEVER modern short hair, NEVER modern hairstyle, NEVER buzz cut, NEVER side part, NEVER any modern haircut, NEVER ponytail with elastic band. "
+            "AGE LOCK: the character's apparent age must strictly match the age specified above, NEVER depict as older or younger. "
+            "Mystical atmosphere, high detail, consistent character design reference sheet for image-to-image continuity."
+        )
+    print("    [定妆照] 首次生成 %s (type=%s)" % (char_id, entity_type))
     url = _call_image_api(portrait_prompt, reference_image_b64=None)
     if not url:
         return None
@@ -138,22 +159,23 @@ def get_or_create_portrait(char_id: str, appearance_desc: str) -> Optional[str]:
     return path
 
 
-def _collect_characters(episode: Dict) -> Dict[str, str]:
-    """从 episode 中收集角色 ID → 完整外貌描述（用于定妆照）。
+def _collect_characters(episode: Dict) -> Dict[str, Dict]:
+    """从 episode 中收集角色 ID → {desc, entity_type}（用于定妆照）。
 
     优先用记忆库人物档案的固定字段（age/identity/appearance/attire/personality）
     组合成完整外貌描述；档案缺失时回退到 scene 内的 appearance/state_change。
+    entity_type 从档案或 scene 内推断；灵体角色（如薪火）走特殊画法。
     """
-    chars: Dict[str, str] = {}
+    chars: Dict[str, Dict] = {}
     # 先从 episode scenes 收集所有角色 ID（保持出场顺序）
     for sc in episode.get("scenes", []):
         for c in sc.get("characters", []):
             if isinstance(c, dict):
                 cid = c.get("char_id") or c.get("name")
                 if cid and cid not in chars:
-                    # scene 内可能带 appearance（plot_parser 新输出）
                     desc = c.get("appearance") or c.get("state_change") or cid
-                    chars[cid] = desc
+                    et = c.get("entity_type") or ("spirit" if "灵体" in (c.get("identity","") or "") else "human")
+                    chars[cid] = {"desc": desc, "entity_type": et}
     # 用记忆库人物档案的固定字段组合成完整外貌描述
     try:
         from agents import get_memory_agent
@@ -168,9 +190,15 @@ def _collect_characters(episode: Dict) -> Dict[str, str]:
                     if v:
                         parts.append(f"{k}: {v}")
                 if parts:
-                    chars[cid] = "; ".join(parts)
+                    chars[cid]["desc"] = "; ".join(parts)
                 elif prof.get("appearance"):
-                    chars[cid] = prof["appearance"]
+                    chars[cid]["desc"] = prof["appearance"]
+                # entity_type 优先用档案值
+                et_prof = prof.get("entity_type")
+                if et_prof:
+                    chars[cid]["entity_type"] = et_prof
+                elif "灵体" in (prof.get("identity","") or "") or "薪火" in cid:
+                    chars[cid]["entity_type"] = "spirit"
     except Exception:
         pass
     return chars
@@ -187,8 +215,8 @@ def generate_images(episode: Dict, prompts: List[str], ep_dir: str) -> List[Opti
 
     # 收集角色定妆照
     char_portraits: Dict[str, str] = {}
-    for cid, desc in _collect_characters(episode).items():
-        p = get_or_create_portrait(cid, desc)
+    for cid, info in _collect_characters(episode).items():
+        p = get_or_create_portrait(cid, info.get("desc", cid), info.get("entity_type", "human"))
         if p:
             char_portraits[cid] = p
 
@@ -248,7 +276,26 @@ def generate_images(episode: Dict, prompts: List[str], ep_dir: str) -> List[Opti
             if path:
                 print("    [生图] %03d/%d 完成" % (idx + 1, len(prompts)))
     ok_count = sum(1 for r in results if r)
-    print("    [生图] 完成: %d/%d 成功" % (ok_count, len(prompts)))
+    print("    [生图] 首轮完成: %d/%d 成功" % (ok_count, len(prompts)))
+
+    # 补图机制：对失败（None）的图重试补全，最多两轮
+    for retry_round in range(2):
+        missing = [i for i, r in enumerate(results) if not r]
+        if not missing:
+            break
+        print("    [生图] 补图第%d轮：缺 %d 张，重试" % (retry_round + 1, len(missing)))
+        with ThreadPoolExecutor(max_workers=cfg.media.image_concurrency) as pool:
+            futs = {pool.submit(_one, (i, prompts[i])): i for i in missing}
+            for fut in as_completed(futs):
+                idx, path = fut.result()
+                if path:
+                    results[idx] = path
+                    print("    [生图] %03d/%d 补图成功" % (idx + 1, len(prompts)))
+        ok_count = sum(1 for r in results if r)
+        print("    [生图] 补图第%d轮后: %d/%d 成功" % (retry_round + 1, ok_count, len(prompts)))
+
+    final_count = sum(1 for r in results if r)
+    print("    [生图] 最终完成: %d/%d 成功" % (final_count, len(prompts)))
     return results
 
 
@@ -464,8 +511,8 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
                pan_direction: str = "down") -> Optional[str]:
     """单张图片 + 音频片段合成片段 mp4，带 Ken Burns 垂直平移动效。
 
-    动效：图片先放大到宽 1280 / 高度 ≈1.18 倍视频高，固定窗口(85%放大后高度)
-    从一端匀速平移到另一端，t/duration 线性插值，duration 内刚好滑完全程。
+    动效（85%/15%设计）：图片先放大到 W x (H/0.85)≈H*1.176，
+    让初始窗口(H)就展示图片85%高度，剩余15%通过滑动窗口展示。
     pan_direction: "down"=窗口从图片顶部往下滑(图片从上往下展开);
                    "up"  =窗口从图片底部往上滑(图片从下往上展开)。
 
@@ -510,27 +557,28 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
     W = int(w)
     H = int(h)
 
-    # ── Ken Burns 垂直平移动效（zoompan 实现，子像素平滑） ──
-    # 用 zoompan filter 在放大的画布上做垂直平移：
-    # 1. 先 scale 到 W x (H*1.6)，留充足滑动空间
-    # 2. zoompan: 固定缩放1.0，y 坐标从一端线性移到另一端
-    # 3. zoompan 输出帧大小 = H（窗口大小）
-    # s=duration*fps 指定总帧数；d=1 单帧输入
-    total_frames = max(1, int(dur * fps))
-    pan_range_expr = "ih*0.375"  # 滑动范围 = 放大后高度 - 窗口高度 = H*1.6 - H = H*0.6, 但用0.375留边距
+    # ── Ken Burns 垂直平移动效（crop + t 表达式，子像素平滑） ──
+    # 设计：初始展示图片85%，剩余15%通过滑动窗口展示
+    # 1. scale 到 W x (H/0.85) ≈ W x (H*1.176)，让窗口(H)占图片85%高度
+    # 2. crop=W:H:0:y_expr 按时间从一端线性移到另一端，滑动范围 = H/0.85 - H ≈ H*0.176
+    # pan_total ≈ 127 像素（H=720时）
+    ZOOM_RATIO = 1.176  # 1/0.85，让窗口初始占图片85%
+    img_h = int(H * ZOOM_RATIO)
+    pan_total = img_h - H  # 滑动总位移 ≈ H*0.176
+    safe_dur = max(0.1, dur)
     if pan_direction == "up":
-        # y 从 max 往 0 移动（图片从下往上展开）
-        y_expr = "%s*(1-on/%d)" % (pan_range_expr, total_frames)
+        # 窗口从底部 y=pan_total 滑到 y=0（图片从下往上展开）
+        y_expr = "%d*(1-t/%.3f)" % (pan_total, safe_dur)
     else:
-        # y 从 0 往 max 移动（图片从上往下展开）
-        y_expr = "%s*(on/%d)" % (pan_range_expr, total_frames)
+        # 窗口从顶部 y=0 滑到 y=pan_total（图片从上往下展开）
+        y_expr = "%d*(t/%.3f)" % (pan_total, safe_dur)
 
     vf = (
-        "scale=%d:%d:flags=lanczos,"           # 放大到 W x (H*1.6)
+        "scale=%d:%d:flags=lanczos,"           # 放大到 W x (H*1.176)
         "setsar=1,"
-        "zoompan=z='1':d=%d:s=%dx%d:x='0':y='%s':fps=%d,"
+        "crop=%d:%d:0:'%s',"                   # 裁剪窗口按 t 移动
         "format=yuv420p"
-    ) % (W, int(H * 1.6), total_frames, W, H, y_expr, fps)
+    ) % (W, img_h, W, H, y_expr)
 
     cmd = [exe, "-y"] + img_arg + aud_arg + [
         "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
@@ -745,6 +793,27 @@ def media_synthesizer_node(state: Dict) -> Dict:
         if fut_aud:
             audio_paths = fut_aud.result()
 
+    # 缺图占位补全：image_paths 中的 None 项用前一张成功的图填充，避免视频黑屏
+    img_dir = os.path.join(ep_dir, "images")
+    last_ok = None
+    for i, p in enumerate(image_paths):
+        if p and os.path.exists(p):
+            last_ok = p
+        elif last_ok:
+            # 复制前一张成功图作为占位
+            import shutil as _sh
+            placeholder = os.path.join(img_dir, "%03d.png" % i)
+            try:
+                _sh.copy(last_ok, placeholder)
+                image_paths[i] = placeholder
+                print("    [补图] 第%d张缺失，用前一张占位" % (i + 1))
+            except Exception:
+                pass
+    # 仍然为 None 的项统计
+    still_missing = sum(1 for p in image_paths if not p)
+    if still_missing:
+        print("    [补图] 仍有 %d 张图无法占位（首图就失败）" % still_missing)
+
     print("  [阶段3] 拼接视频（Ken Burns 平移 + start_ratio 对齐）...")
     video_path = compose_video(image_paths, audio_paths, tts_meta, ep_dir, eid,
                                image_prompts=prompts)
@@ -752,7 +821,55 @@ def media_synthesizer_node(state: Dict) -> Dict:
     if video_path:
         sz_mb = os.path.getsize(video_path) / (1024 * 1024)
         print("[合成] %s 完成: %s (%.1f MB)" % (eid, video_path, sz_mb))
+        # 黑屏检测：扫描视频找黑屏帧，统计黑屏占比
+        black_pct = _detect_black_frames(video_path)
+        if black_pct > 0.5:
+            print("    [黑屏] 警告：%.1f%% 帧为黑/暗屏，建议核查缺失图片" % black_pct)
+        elif black_pct > 0:
+            print("    [黑屏] 检测到 %.1f%% 暗帧（可接受范围）" % black_pct)
     else:
         print("[合成] %s 视频未生成（图片/音频已落盘）" % eid)
 
     return {"video_path": video_path}
+
+
+def _detect_black_frames(video_path: str, threshold: float = 0.07) -> float:
+    """用 ffmpeg blackdetect 扫描视频，返回黑屏时长占比%。
+
+    threshold: 像素亮度阈值（0~1，默认0.07≈18/255），低于此值视为黑/暗。
+    纯黑帧=0，深蓝placeholder(0x1a1a2e≈26/255≈0.10)也能检出。
+    """
+    exe = _ffmpeg_path()
+    try:
+        r = subprocess.run(
+            [exe, "-i", video_path,
+             "-vf", "blackdetect=d=0.1:pix_th=%.2f" % threshold,
+             "-an", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+        # 总时长
+        total = 0.0
+        for line in (r.stderr or "").splitlines():
+            if "Duration:" in line:
+                seg = line.split("Duration:")[1].split(",")[0].strip()
+                h, m, s = seg.split(":")
+                total = int(h) * 3600 + int(m) * 60 + float(s)
+                break
+        if total <= 0:
+            return 0.0
+        # 累计黑屏时长
+        black_total = 0.0
+        for line in (r.stderr or "").splitlines():
+            if "black_duration" in line:
+                # line: [blackdetect @ ...] black_duration:1.234 start:5.6 ...
+                parts = line.split("black_duration:")
+                if len(parts) > 1:
+                    seg = parts[1].split()[0]
+                    try:
+                        black_total += float(seg)
+                    except ValueError:
+                        pass
+        return black_total / total * 100.0
+    except Exception as e:
+        print("    [黑屏] 检测失败: %s" % e)
+        return 0.0

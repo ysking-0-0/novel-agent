@@ -85,8 +85,58 @@ def extract_json(content: Any, default: Any = None) -> Any:
                 return json.loads(cleaned)
             except json.JSONDecodeError:
                 pass
+        # 4. 终极容错：MiniMax 有时把 JSON 结构分隔的字面 \n / \t 写成
+        #    反斜杠+n/t（双字符），导致 json.loads 失败。在字符串引号之外
+        #    把这些字面转义还原为真实字符再尝试。仅做最佳努力，不保证成功。
+        repaired = _fix_literal_escapes_outside_strings(candidate)
+        if repaired != candidate:
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                try:
+                    cleaned = re.sub(r",\s*([}\]])", r"\1", repaired)
+                    return json.loads(cleaned)
+                except json.JSONDecodeError:
+                    pass
 
     return default
+
+
+def _fix_literal_escapes_outside_strings(text: str) -> str:
+    """把 JSON 字符串引号之外的字面 \\n / \\t / \\r 还原为真实字符。
+
+    仅处理 \" 与字符串内部不触碰。状态机扫描: in_string 标记是否在
+    双引号字符串内；遇 \" 反斜杠后跳过下一字符以正确处理内部转义。
+    """
+    out = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == "\"":
+                in_string = False
+            i += 1
+            continue
+        # 引号外
+        if ch == "\"":
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n and text[i + 1] in "ntr":
+            out.append({"n": "\n", "t": "\t", "r": "\r"}[text[i + 1]])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _extract_balanced(text: str, open_ch: str, close_ch: str) -> Optional[str]:
