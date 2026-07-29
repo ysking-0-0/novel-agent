@@ -524,7 +524,7 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
 
     # 图片输入
     if image_path and os.path.exists(image_path):
-        img_arg = ["-loop", "1", "-i", image_path]
+        img_arg = ["-loop", "1", "-framerate", str(fps), "-i", image_path]
     else:
         placeholder = os.path.join(tmp_dir, "placeholder.png")
         if not os.path.exists(placeholder):
@@ -535,7 +535,7 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
                  "-frames:v", "1", placeholder],
                 capture_output=True, timeout=30,
             )
-        img_arg = ["-loop", "1", "-i", placeholder]
+        img_arg = ["-loop", "1", "-framerate", str(fps), "-i", placeholder]
 
     # 音频输入与时长
     if audio_path and os.path.exists(audio_path):
@@ -582,6 +582,8 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
 
     cmd = [exe, "-y"] + img_arg + aud_arg + [
         "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-bf", "0",                    # 禁用B帧，避免预测帧复用导致画面卡顿
+        "-r", str(fps),                # 输出帧率
         "-c:a", "aac", "-b:a", "128k", "-t", "%.2f" % dur,
     ] + extra + [out]
     try:
@@ -690,7 +692,8 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
     try:
         subprocess.run(
             [exe, "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
-             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0",
+             "-c:a", "aac",
              "-r", str(cfg.media.video_fps), concat_out],
             capture_output=True, timeout=600,
         )
@@ -716,7 +719,7 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
                  "-filter_complex",
                  "[1:a]volume=%.2f[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]" % cfg.media.bgm_volume,
                  "-map", "0:v", "-map", "[a]",
-                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0", "-c:a", "aac",
                  "-r", str(cfg.media.video_fps), "-shortest", out],
                 capture_output=True, timeout=600,
             )
@@ -728,7 +731,7 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
                      "-filter_complex",
                      "[1:a]volume=%.2f[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]" % cfg.media.bgm_volume,
                      "-map", "0:v", "-map", "[a]",
-                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0", "-c:a", "aac",
                      "-r", str(cfg.media.video_fps), "-shortest", out],
                     capture_output=True, timeout=600,
                 )
