@@ -557,28 +557,32 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
     W = int(w)
     H = int(h)
 
-    # ── Ken Burns 垂直平移动效（crop + t 表达式，子像素平滑） ──
+    # ── Ken Burns 垂直平移动效（子像素平滑·crop整数舍入修复） ──
     # 设计：初始展示图片85%，剩余15%通过滑动窗口展示
-    # 1. scale 到 W x (H/0.85) ≈ W x (H*1.176)，让窗口(H)占图片85%高度
-    # 2. crop=W:H:0:y_expr 按时间从一端线性移到另一端，滑动范围 = H/0.85 - H ≈ H*0.176
-    # pan_total ≈ 127 像素（H=720时）
-    ZOOM_RATIO = 1.176  # 1/0.85，让窗口初始占图片85%
-    img_h = int(H * ZOOM_RATIO)
-    pan_total = img_h - H  # 滑动总位移 ≈ H*0.176
+    # 问题：crop 的 y 坐标被取整，小范围滑动(127px/3s≈1.4px/帧)时
+    #       连续多帧 y 值相同导致画面停滞，跳到下一整数时又突跳=卡顿
+    # 修复：先 scale 放大4倍，在放大域 crop 整数移动 = 原图0.25px移动，
+    #       再 scale 回原始尺寸，等效4倍子像素精度，滑动平滑无卡顿
+    ZOOM_RATIO = 1.176          # 1/0.85，让窗口初始占图片85%
+    SUBPIXEL = 4                # 子像素放大倍数
+    img_h_up = int(H * ZOOM_RATIO * SUBPIXEL)   # 放大域图片高
+    win_h_up = H * SUBPIXEL                      # 放大域窗口高
+    pan_total_up = img_h_up - win_h_up           # 放大域滑动总位移
     safe_dur = max(0.1, dur)
     if pan_direction == "up":
-        # 窗口从底部 y=pan_total 滑到 y=0（图片从下往上展开）
-        y_expr = "%d*(1-t/%.3f)" % (pan_total, safe_dur)
+        # 窗口从底部滑到顶部（图片从下往上展开）
+        y_expr = "%d*(1-t/%.3f)" % (pan_total_up, safe_dur)
     else:
-        # 窗口从顶部 y=0 滑到 y=pan_total（图片从上往下展开）
-        y_expr = "%d*(t/%.3f)" % (pan_total, safe_dur)
+        # 窗口从顶部滑到底部（图片从上往下展开）
+        y_expr = "%d*(t/%.3f)" % (pan_total_up, safe_dur)
 
     vf = (
-        "scale=%d:%d:flags=lanczos,"           # 放大到 W x (H*1.176)
+        "scale=%d:%d:flags=lanczos,"           # 放大到 W x (H*1.176*4)
         "setsar=1,"
-        "crop=%d:%d:0:'%s',"                   # 裁剪窗口按 t 移动
+        "crop=%d:%d:0:'%s',"                   # 在放大域按 t 移动(整数)
+        "scale=%d:%d:flags=lanczos,"           # 缩回原始 W x H
         "format=yuv420p"
-    ) % (W, img_h, W, H, y_expr)
+    ) % (W, img_h_up, W, win_h_up, y_expr, W, H)
 
     cmd = [exe, "-y"] + img_arg + aud_arg + [
         "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
