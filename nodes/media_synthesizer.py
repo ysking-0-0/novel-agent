@@ -124,9 +124,10 @@ def get_or_create_portrait(char_id: str, appearance_desc: str) -> Optional[str]:
         + (appearance_desc or char_id)
         + ". Handsome and heroic if male, beautiful and ethereal if female. "
         "Ancient Chinese attire matching cultivation realm. "
-        "HAIR (MANDATORY): long hair in ancient Chinese style, topknot or bun with jade hairpin or wooden hairpin or bone hairpin, "
-        "NEVER modern short hair, NEVER modern hairstyle, hair must be long and tied up in traditional ancient Chinese manner. "
-        "Mystical atmosphere, high detail, consistent character design sheet for image-to-image continuity."
+        "HAIR (ABSOLUTE MANDATORY): long black hair in ancient Chinese style, topknot or bun tied with jade hairpin or wooden hairpin or bone hairpin, "
+        "hair must be LONG and tied up, ABSOLUTELY NEVER modern short hair, NEVER modern hairstyle, NEVER buzz cut, NEVER side part, NEVER any modern haircut. "
+        "AGE LOCK: the character's apparent age must strictly match the age specified above, NEVER depict as older or younger. "
+        "Mystical atmosphere, high detail, consistent character design reference sheet for image-to-image continuity."
     )
     print("    [定妆照] 首次生成 %s" % char_id)
     url = _call_image_api(portrait_prompt, reference_image_b64=None)
@@ -509,25 +510,27 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
     W = int(w)
     H = int(h)
 
-    # ── Ken Burns 垂直平移动效 ──
-    # 步骤1: 先 scale 到宽 W，高度按比例放大 1.18 倍（留滑动空间）
-    # 步骤2: crop 固定窗口 H 高度，y 坐标从 0 到 (scaledH - H) 线性平移
-    #   方向 "down": y 从 0 → max_y（窗口下移，图片从上往下展开）
-    #   方向 "up":   y 从 max_y → 0（窗口上移，图片从下往上展开）
+    # ── Ken Burns 垂直平移动效（zoompan 实现，子像素平滑） ──
+    # 用 zoompan filter 在放大的画布上做垂直平移：
+    # 1. 先 scale 到 W x (H*1.6)，留充足滑动空间
+    # 2. zoompan: 固定缩放1.0，y 坐标从一端线性移到另一端
+    # 3. zoompan 输出帧大小 = H（窗口大小）
+    # s=duration*fps 指定总帧数；d=1 单帧输入
+    total_frames = max(1, int(dur * fps))
+    pan_range_expr = "ih*0.375"  # 滑动范围 = 放大后高度 - 窗口高度 = H*1.6 - H = H*0.6, 但用0.375留边距
     if pan_direction == "up":
-        y_expr = "(max_y)*(1-min(t\\/%.2f\\,1))" % dur
+        # y 从 max 往 0 移动（图片从下往上展开）
+        y_expr = "%s*(1-on/%d)" % (pan_range_expr, total_frames)
     else:
-        y_expr = "(max_y)*min(t\\/%.2f\\,1)" % dur
+        # y 从 0 往 max 移动（图片从上往下展开）
+        y_expr = "%s*(on/%d)" % (pan_range_expr, total_frames)
 
     vf = (
-        "scale=%d:-2:flags=lanczos,"          # 宽到 W，高自适应
-        "scale=-1:ih*1.18:flags=lanczos,"      # 高度放大1.18倍(留平移空间)
-        "crop=%d:%d:0:'%s',"                    # 固定窗口 H，y 按表达式平移
-        "fps=%d"
-    ) % (W, W, H, y_expr, fps)
-    # max_y = 放大后高度 - 窗口高度，需让表达式访问到
-    # FFmpeg crop 中可用 'ih' 取当前(放大后)帧高度，直接内联
-    vf = vf.replace("(max_y)", "((ih-%d))" % H)
+        "scale=%d:%d:flags=lanczos,"           # 放大到 W x (H*1.6)
+        "setsar=1,"
+        "zoompan=z='1':d=%d:s=%dx%d:x='0':y='%s':fps=%d,"
+        "format=yuv420p"
+    ) % (W, int(H * 1.6), total_frames, W, H, y_expr, fps)
 
     cmd = [exe, "-y"] + img_arg + aud_arg + [
         "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
@@ -631,29 +634,22 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
 
     out = os.path.join(ep_dir, "%s.mp4" % eid)
     exe = _ffmpeg_path()
-    # 第一步：concat 拼接（可能 stream copy 或重编码）→ 临时文件
+    # 第一步：concat 拼接 → 临时文件
+    # 注意：必须重编码（不能用 -c copy），因为各片段的 zoompan 帧时间戳独立计算，
+    # stream copy 会保留不连续的时间戳，导致抽帧跳到错误关键帧、动效丢失。
     concat_out = os.path.join(tmp_dir, "concat.mp4")
     concat_ok = False
     try:
         subprocess.run(
-            [exe, "-y", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", concat_out],
-            capture_output=True, timeout=300,
+            [exe, "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+             "-r", str(cfg.media.video_fps), concat_out],
+            capture_output=True, timeout=600,
         )
         if os.path.exists(concat_out) and os.path.getsize(concat_out) > 1000:
             concat_ok = True
     except Exception as e:
-        print("    [视频] stream copy 失败: %s，尝试重编码" % e)
-    if not concat_ok:
-        try:
-            subprocess.run(
-                [exe, "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
-                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", concat_out],
-                capture_output=True, timeout=600,
-            )
-            if os.path.exists(concat_out) and os.path.getsize(concat_out) > 1000:
-                concat_ok = True
-        except Exception as e2:
-            print("    [视频] 重编码也失败: %s" % e2)
+        print("    [视频] concat 重编码失败: %s" % e)
 
     if not concat_ok:
         print("    [视频] concat 拼接失败")
@@ -661,6 +657,7 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
 
     # 第二步：混入 BGM（循环播放 + volume）→ 最终输出
     # BGM 用 stream_loop=-1 无限循环，duration=first 对齐视频时长，视频在BGM就继续放
+    # 注意：视频必须重编码（-c:v libx264），不能用 copy，否则 zoompan 动效帧时间戳会错乱
     cfg = get_config()
     bgm = cfg.media.bgm_path
     if bgm and os.path.exists(bgm):
@@ -671,18 +668,20 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
                  "-filter_complex",
                  "[1:a]volume=%.2f[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]" % cfg.media.bgm_volume,
                  "-map", "0:v", "-map", "[a]",
-                 "-c:v", "copy", "-c:a", "aac", "-shortest", out],
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                 "-r", str(cfg.media.video_fps), "-shortest", out],
                 capture_output=True, timeout=600,
             )
             if not (os.path.exists(out) and os.path.getsize(out) > 1000):
-                # copy v 失败，重编码视频
+                print("    [视频] BGM 混入首次失败，重试")
                 subprocess.run(
                     [exe, "-y", "-i", concat_out,
                      "-stream_loop", "-1", "-i", bgm,
                      "-filter_complex",
                      "[1:a]volume=%.2f[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]" % cfg.media.bgm_volume,
                      "-map", "0:v", "-map", "[a]",
-                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out],
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                     "-r", str(cfg.media.video_fps), "-shortest", out],
                     capture_output=True, timeout=600,
                 )
         except Exception as e:

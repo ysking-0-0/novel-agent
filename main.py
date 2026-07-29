@@ -143,19 +143,59 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
     # 运行图
     print("=" * 60)
     print("进入主生产循环...")
+    # 节点中文名映射，用于进度展示
+    NODE_LABELS = {
+        "text_chunker": "文本分片", "plot_parser": "剧情解析",
+        "episode_aggregator": "剧集聚合", "episode_aggregator_force": "末尾强制打包",
+        "material_generator": "素材生成", "format_validator": "格式校验",
+        "memory_prefetch": "记忆预检索", "parallel_reviews": "并行评审",
+        "review_arbiter": "评审仲裁", "retry_counter": "重试计数",
+        "persistence": "归档", "media_synthesizer": "多媒体合成",
+    }
     try:
         for output in graph.stream(input_state, config=config, stream_mode="updates"):
             for node_name, update in output.items():
-                # 汇报进度
                 if not isinstance(update, dict):
                     continue
+                label = NODE_LABELS.get(node_name, node_name)
+                # 汇报当前节点执行
                 ep = update.get("current_episode")
                 completed = update.get("completed_episode_count")
+                fe = update.get("format_errors")
+                rr = update.get("review_result")
+                # 当前集上下文
+                done = input_state.get("completed_episode_count", state.get("completed_episode_count", 0)) if isinstance(input_state, dict) else state.get("completed_episode_count", 0)
+                target_n = state.get("target_episode_count")
+                target_disp = f"/{target_n}" if target_n else ""
+                # 评审结果
+                if rr and isinstance(rr, dict):
+                    verdict = rr.get("verdict", "?")
+                    print(f"  [{label}] 评审结论: {verdict}")
+                if fe:
+                    errs = fe if isinstance(fe, list) else [fe]
+                    print(f"  [{label}] 格式错误({len(errs)}): {str(errs[0])[:80]}")
                 if completed is not None:
-                    print(f"[进度] 已完成 {completed} 集")
-                if ep is not None and node_name == "episode_aggregator":
-                    eid = ep.get("episode_id", "?")
-                    print(f"[生产] 新集已聚合: {eid}")
+                    print(f"[进度] 已完成 {completed}{target_disp} 集")
+                if ep is not None and node_name in ("episode_aggregator", "episode_aggregator_force"):
+                    eid = ep.get("episode_id", "?") if isinstance(ep, dict) else "?"
+                    sc = len(ep.get("scenes", [])) if isinstance(ep, dict) else 0
+                    print(f"[生产] 新集聚合: {eid} ({sc} 场景)")
+                elif node_name in ("text_chunker", "plot_parser", "material_generator",
+                                   "format_validator", "memory_prefetch", "parallel_reviews",
+                                   "review_arbiter", "retry_counter", "persistence", "media_synthesizer"):
+                    # 阶段进度
+                    extra = ""
+                    if node_name == "text_chunker":
+                        off = update.get("offset", 0)
+                        extra = f" offset={off}"
+                    elif node_name == "material_generator":
+                        ni = len(update.get("episode_image_prompts") or [])
+                        nt = len(update.get("episode_tts_meta") or [])
+                        extra = f" 生图prompt={ni} TTS段={nt}"
+                    elif node_name == "persistence":
+                        vid = update.get("video_path")
+                        extra = " 视频=已归档" if vid else ""
+                    print(f"  [{label}] 执行{extra}")
     except KeyboardInterrupt:
         print("\n[手动停止] LangGraph 已自动保存最近节点状态，下次 --resume 可续跑")
     except Exception as e:
