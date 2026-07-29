@@ -68,10 +68,10 @@ class MediaConfig:
     enable_synthesis: bool = (
         os.getenv("ENABLE_SYNTHESIS", "true").lower() == "true"
     )
-    # 生图并发数（MiniMax 限流未知，保守默认 3）
-    image_concurrency: int = int(os.getenv("IMAGE_CONCURRENCY", "3"))
-    # TTS 并发数（MiniMax TTS 并发限流敏感，默认串行=1）
-    tts_concurrency: int = int(os.getenv("TTS_CONCURRENCY", "1"))
+    # 生图并发数（实测 image-01 在 4 并发内不排队，5 并发会被限流）
+    image_concurrency: int = int(os.getenv("IMAGE_CONCURRENCY", "4"))
+    # TTS 并发数（speech-02-hd 单次约 1.4s，4 并发安全）
+    tts_concurrency: int = int(os.getenv("TTS_CONCURRENCY", "4"))
     # 生图模型
     image_model: str = os.getenv("IMAGE_MODEL", "image-01")
     # TTS 模型

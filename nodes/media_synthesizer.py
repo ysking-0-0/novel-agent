@@ -120,11 +120,13 @@ def get_or_create_portrait(char_id: str, appearance_desc: str) -> Optional[str]:
 
     portrait_prompt = (
         "ancient Chinese mythology art style, character reference portrait, front view, "
-        "neutral background, full face visible. "
+        "neutral background, full body visible. "
         + (appearance_desc or char_id)
         + ". Handsome and heroic if male, beautiful and ethereal if female. "
-        "Ancient Chinese attire matching cultivation realm, jade hairpin or topknot. "
-        "Mystical atmosphere, high detail, consistent character design sheet."
+        "Ancient Chinese attire matching cultivation realm. "
+        "HAIR (MANDATORY): long hair in ancient Chinese style, topknot or bun with jade hairpin or wooden hairpin or bone hairpin, "
+        "NEVER modern short hair, NEVER modern hairstyle, hair must be long and tied up in traditional ancient Chinese manner. "
+        "Mystical atmosphere, high detail, consistent character design sheet for image-to-image continuity."
     )
     print("    [定妆照] 首次生成 %s" % char_id)
     url = _call_image_api(portrait_prompt, reference_image_b64=None)
@@ -457,10 +459,16 @@ def _audio_duration(path: str) -> float:
 
 def _make_clip(image_path: Optional[str], audio_path: Optional[str],
                idx: int, tmp_dir: str, resolution: str, fps: int,
-               duration: float = None, audio_seek: float = 0) -> Optional[str]:
-    """单张图片 + 音频片段合成片段 mp4。
+               duration: float = None, audio_seek: float = 0,
+               pan_direction: str = "down") -> Optional[str]:
+    """单张图片 + 音频片段合成片段 mp4，带 Ken Burns 垂直平移动效。
 
-    duration: 指定片段时长（用于同段音频内多图均分）。
+    动效：图片先放大到宽 1280 / 高度 ≈1.18 倍视频高，固定窗口(85%放大后高度)
+    从一端匀速平移到另一端，t/duration 线性插值，duration 内刚好滑完全程。
+    pan_direction: "down"=窗口从图片顶部往下滑(图片从上往下展开);
+                   "up"  =窗口从图片底部往上滑(图片从下往上展开)。
+
+    duration: 指定片段时长（用于同段音频内多图切片）。
     audio_seek: 音频起始偏移（秒），用于同段音频内多图切片。
     """
     exe = _ffmpeg_path()
@@ -498,7 +506,29 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
         extra = ["-t", "%.2f" % dur]
 
     w, h = resolution.split("x")
-    vf = "scale=%s:%s:force_original_aspect_ratio=decrease,pad=%s:%s:(ow-iw)/2:(oh-ih)/2:black,fps=%d" % (w, h, w, h, fps)
+    W = int(w)
+    H = int(h)
+
+    # ── Ken Burns 垂直平移动效 ──
+    # 步骤1: 先 scale 到宽 W，高度按比例放大 1.18 倍（留滑动空间）
+    # 步骤2: crop 固定窗口 H 高度，y 坐标从 0 到 (scaledH - H) 线性平移
+    #   方向 "down": y 从 0 → max_y（窗口下移，图片从上往下展开）
+    #   方向 "up":   y 从 max_y → 0（窗口上移，图片从下往上展开）
+    if pan_direction == "up":
+        y_expr = "(max_y)*(1-min(t\\/%.2f\\,1))" % dur
+    else:
+        y_expr = "(max_y)*min(t\\/%.2f\\,1)" % dur
+
+    vf = (
+        "scale=%d:-2:flags=lanczos,"          # 宽到 W，高自适应
+        "scale=-1:ih*1.18:flags=lanczos,"      # 高度放大1.18倍(留平移空间)
+        "crop=%d:%d:0:'%s',"                    # 固定窗口 H，y 按表达式平移
+        "fps=%d"
+    ) % (W, W, H, y_expr, fps)
+    # max_y = 放大后高度 - 窗口高度，需让表达式访问到
+    # FFmpeg crop 中可用 'ih' 取当前(放大后)帧高度，直接内联
+    vf = vf.replace("(max_y)", "((ih-%d))" % H)
+
     cmd = [exe, "-y"] + img_arg + aud_arg + [
         "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", "-t", "%.2f" % dur,
@@ -519,7 +549,8 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
 
     支持细粒度图片：image_prompts 可能多于 tts_meta，
     每个 image_prompt 的 narration_segment 标注对应第几段语音（1-based）。
-    同一语音段内的多张图按音频时长均分展示。
+    同一语音段内的多张图按 start_ratio 精确定位出现时间（非均分）。
+    每张图带 Ken Burns 垂直平移动效（方向交替）。
     """
     if not image_paths and not audio_paths:
         return None
@@ -528,18 +559,24 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
     tmp_dir = os.path.join(ep_dir, "_tmp_clips")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # 按 narration_segment 分组图片到对应语音段
-    # narration_segment 是 1-based（对应 tts_meta index）
-    seg_images: Dict[int, List[Optional[str]]] = {}  # segment(1-based) -> [image_path]
+    # 每张图收集 (path, narration_segment, start_ratio)
+    seg_images: Dict[int, List[Dict]] = {}  # segment(1-based) -> [{path, start_ratio}]
     for i, img_path in enumerate(image_paths):
         narr_seg = None
+        sr = 0.0
         if image_prompts and i < len(image_prompts):
             p = image_prompts[i]
-            narr_seg = p.get("narration_segment") if isinstance(p, dict) else None
+            if isinstance(p, dict):
+                narr_seg = p.get("narration_segment")
+                try:
+                    sr = float(p.get("start_ratio", 0.0) or 0.0)
+                    sr = max(0.0, min(1.0, sr))
+                except (ValueError, TypeError):
+                    sr = 0.0
         # 没有 narration_segment 的图，按 index 顺序分配（回退：分到第 i+1 段或最后一段）
         if narr_seg is None:
             narr_seg = min(i + 1, len(tts_meta)) if tts_meta else 1
-        seg_images.setdefault(narr_seg, []).append(img_path)
+        seg_images.setdefault(narr_seg, []).append({"path": img_path, "start_ratio": sr})
 
     clips: List[str] = []
     clip_idx = 0
@@ -547,27 +584,40 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
     for seg_idx in range(len(tts_meta)):
         seg_no = seg_idx + 1  # 1-based
         aud = audio_paths[seg_idx] if seg_idx < len(audio_paths) else None
-        # 该段的图片列表
-        imgs = seg_images.get(seg_no, [])
+        # 该段的图片列表（按 start_ratio 排序，确保出现顺序正确）
+        imgs = sorted(seg_images.get(seg_no, []), key=lambda x: x["start_ratio"])
         if not imgs:
-            # 无图，用占位
-            imgs = [None]
+            imgs = [{"path": None, "start_ratio": 0.0}]
         # 音频时长
         if aud and os.path.exists(aud):
             seg_dur = _audio_duration(aud)
         else:
             seg_dur = 3.0
-        # 均分时长给每张图，每张图取音频的对应片段
-        per_img = seg_dur / len(imgs)
-        seek_acc = 0.0
-        for img in imgs:
-            clip = _make_clip(img, aud, clip_idx, tmp_dir,
+        # 用 start_ratio 精确计算每张图的起点与时长
+        # 该图起点 = start_ratio * seg_dur；时长 = 下张图起点 - 本张图起点（末张=段尾）
+        starts = [img["start_ratio"] * seg_dur for img in imgs]
+        # 保证最后一张覆盖到段尾
+        for i in range(len(starts) - 1, -1, -1):
+            if i == len(starts) - 1:
+                starts[i] = starts[i] if starts[i] < seg_dur else max(0, seg_dur - 0.5)
+            else:
+                # 若相邻图起点相同（start_ratio 重合），回退到均分
+                if starts[i + 1] <= starts[i]:
+                    starts[i] = starts[i + 1] * (i / (len(starts)))
+        # 每张图时长 = 下张起点 - 本张起点；末张 = seg_dur - 本张起点
+        for i, img in enumerate(imgs):
+            t_start = starts[i]
+            t_end = starts[i + 1] if i + 1 < len(imgs) else seg_dur
+            per_img = max(0.3, t_end - t_start)  # 最小0.3s
+            # 平移方向交替：偶数 idx 从上往下，奇数从下往上
+            pan_dir = "down" if clip_idx % 2 == 0 else "up"
+            clip = _make_clip(img["path"], aud, clip_idx, tmp_dir,
                               cfg.media.video_resolution, cfg.media.video_fps,
-                              duration=per_img, audio_seek=seek_acc)
+                              duration=per_img, audio_seek=t_start,
+                              pan_direction=pan_dir)
             if clip:
                 clips.append(clip)
             clip_idx += 1
-            seek_acc += per_img
 
     if not clips:
         print("    [视频] 无可用片段")
@@ -683,21 +733,20 @@ def media_synthesizer_node(state: Dict) -> Dict:
     if not prompts and not tts_meta:
         return {}
 
-    print("[合成] 开始 %s：生图 %d 张，TTS %d 段" % (eid, len(prompts), len(tts_meta)))
+    print("[合成] 开始 %s：生图 %d 张，TTS %d 段（并行）" % (eid, len(prompts), len(tts_meta)))
 
-    if prompts:
-        print("  [阶段1] 生成图片...")
-        image_paths = generate_images(episode, prompts, ep_dir)
-    else:
-        image_paths = []
+    # 生图与 TTS 并行启动（两个独立线程池同时跑，互不阻塞）
+    image_paths: List = []
+    audio_paths: List = []
+    with ThreadPoolExecutor(max_workers=2) as parallel:
+        fut_img = parallel.submit(generate_images, episode, prompts, ep_dir) if prompts else None
+        fut_aud = parallel.submit(generate_tts, tts_meta, ep_dir) if tts_meta else None
+        if fut_img:
+            image_paths = fut_img.result()
+        if fut_aud:
+            audio_paths = fut_aud.result()
 
-    if tts_meta:
-        print("  [阶段2] 生成语音...")
-        audio_paths = generate_tts(tts_meta, ep_dir)
-    else:
-        audio_paths = []
-
-    print("  [阶段3] 拼接视频...")
+    print("  [阶段3] 拼接视频（Ken Burns 平移 + start_ratio 对齐）...")
     video_path = compose_video(image_paths, audio_paths, tts_meta, ep_dir, eid,
                                image_prompts=prompts)
 

@@ -18,6 +18,9 @@ from agents.memory_manager import get_memory_agent
 
 SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成专家。基于一集剧集（Episode）的剧情因果链，一次性生成三类素材，保证情绪、叙事视角统一。
 
+【重要：输出格式（最高优先级）】
+你必须直接输出合法 JSON 对象，不得输出任何思考过程、分析推理、思维链、解释说明。响应必须以 { 开头，以 } 结尾。禁止输出 ```代码块``` 之外的任何文字。禁止输出"让我分析""根据数据"等引导语。JSON 必须包含 script、image_prompts、tts_meta 三个字段。
+
 【讲解文案内容要求（最高优先级）】
 讲解文案不是流水账复述原文，而是面向观众的"剧情解说+背景科普"，必须包含以下要素（按本集内容按需覆盖）：
 
@@ -79,6 +82,10 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
 - 一个TTS段内如果有多句场景描述，必须拆成多张图（每句一个场景/动作一张）
 - image_prompts 的 index 独立递增，与 tts_meta 不要求数量相同（图片数通常远多于TTS段数）
 - 每个 image_prompt 必须标注 narration_segment：对应 tts_meta 的第几段（语音播放到该段时展示此图）
+- 每个 image_prompt 必须标注 start_ratio：0.0-1.0 浮点数，表示该图在所属 narration_segment 语音段的哪个进度位置出现
+  例：0.0=该段语音一开始就出现此图；0.5=该段语音念到一半时切换到此图；1.0=该段语音末尾才出现
+  当一个 narration_segment 内有多张图，按剧情出现顺序分配递增的 start_ratio（如段内2张图→0.0和0.5；3张图→0.0、0.35、0.7）
+  确保口播念到该场景时，对应图片立即出现，而非均分
 
 【输出格式 严格 JSON】
 {
@@ -87,6 +94,7 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
     {
       "index": 1,
       "narration_segment": "对应 tts_meta 的第几段（整数，语音播放到该段时展示此图）",
+      "start_ratio": "0.0-1.0 浮点数，该图在所属语音段中的出现进度位置（0.0=段首, 0.5=段中, 1.0=段尾）",
       "characters": ["本图涉及的角色 char_id 列表（如 ['钟岳','薪火']），用于匹配定妆照保证人物一致",
       "prompt": "以 'ancient Chinese mythology art style, ' 开头的生图Prompt，必须包含：(1) 风格前缀 (2) 人物固定外貌——age年龄、identity身份、appearance发色发型/眼/眉/身材/五官（100%沿用档案，不得改变）、attire穿着 (3) 精确动作与表情 (4) 场景环境（古朴蛮荒磅礴）(5) 关键视觉特征精确写出（四翼金鸟必须写'four-winged golden bird with four distinct wings spread'，不可只写'bird'）(6) 神话氛围光影 (7) 镜头构图。同一人物在所有图中外貌特征完全一致",
       "mood": "本画面情绪关键词"
@@ -115,7 +123,7 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
 4. 人物必须英俊帅气（男）/美丽动人（女），服饰符合境界身份，发饰古风
 5. 关键视觉特征必须精确描述：怪物的形态（几翼/几首/几尾）、武器外形、特殊道具、环境特征，不可用模糊词
 6. 图片粒度（硬性要求）：图片数 ≥ TTS段数，且每10秒至少一张图。一个TTS段内多句场景描述必须拆成多张图。如16段TTS约300秒→至少30张图。
-7. 每个 image_prompt 必须有 narration_segment 标注对应 tts_meta 的第几段
+7. 每个 image_prompt 必须有 narration_segment 标注对应 tts_meta 的第几段，以及 start_ratio 标注在该段中的出现进度位置（0.0-1.0）
 8. 不得新增剧情、不得篡改事实，文案是对原文的口语化转述"""
 
 
@@ -182,13 +190,13 @@ class MaterialGeneratorAgent:
 - 估算图片张数 ≈ 语音总时长 / {cfg.image_duration_target}秒
 - BGM 背景音乐：{'已配置（' + cfg.bgm_path + '），音量' + str(int(cfg.bgm_volume*100)) + '%'}（如适用）
 
-请生成三类素材，输出 JSON。"""
+请生成三类素材，直接输出 JSON，不要输出任何思考过程、分析、解释，不要用思考标签，直接以 {{ 开头输出 JSON。"""
 
     def _parse(self, content) -> Dict:
         from utils import extract_json_dict
         data = extract_json_dict(content)
         if isinstance(data, dict):
-            # 规范化 image_prompts 为 List[dict]，每个含 prompt + narration_segment
+            # 规范化 image_prompts 为 List[dict]，每个含 prompt + narration_segment + start_ratio
             if isinstance(data.get("image_prompts"), list):
                 normalized = []
                 for p in data["image_prompts"]:
@@ -200,6 +208,13 @@ class MaterialGeneratorAgent:
                             narr_seg = int(narr_seg) if narr_seg is not None else None
                         except (ValueError, TypeError):
                             narr_seg = None
+                        # start_ratio: 该图在所属语音段内的出现进度位置 (0.0-1.0)
+                        sr = p.get("start_ratio")
+                        try:
+                            sr = float(sr) if sr is not None else 0.0
+                            sr = max(0.0, min(1.0, sr))
+                        except (ValueError, TypeError):
+                            sr = 0.0
                         # characters 字段：本图涉及的角色 char_id 列表（用于匹配定妆照）
                         chars_in_img = p.get("characters", [])
                         if not isinstance(chars_in_img, list):
@@ -207,11 +222,12 @@ class MaterialGeneratorAgent:
                         normalized.append({
                             "prompt": prompt_text,
                             "narration_segment": narr_seg,
+                            "start_ratio": sr,
                             "mood": p.get("mood", ""),
                             "characters": chars_in_img,
                         })
                     else:
-                        normalized.append({"prompt": str(p), "narration_segment": None, "mood": "", "characters": []})
+                        normalized.append({"prompt": str(p), "narration_segment": None, "start_ratio": 0.0, "mood": "", "characters": []})
                 data["image_prompts"] = normalized
             return data
         # 兜底

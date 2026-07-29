@@ -54,19 +54,29 @@ def _initial_state(novel_path: str, target: int = None) -> Dict[str, Any]:
     }
 
 
-def _resume_state(graph, thread_id: str) -> Dict[str, Any] | None:
-    """尝试从 SqliteSaver 读取断点状态。"""
+def _resume_state(graph, thread_id: str, target_override: int = None) -> Dict[str, Any] | None:
+    """尝试从 SqliteSaver 读取断点状态。
+
+    target_override: 若提供，覆盖断点内的 target_episode_count。
+    用于"上轮已到目标集数但想继续生产更多集"的场景——
+    旧断点已 END(next=空)，直接 invoke 不会动，需要构造可继续的初始状态。
+    """
     try:
         snapshots = list(graph.get_state_history(
             {"configurable": {"thread_id": thread_id}}
         ))
         if not snapshots:
             return None
-        # 取最新一个有数据的 snapshot
         last = snapshots[0]
-        if last and last.values and len(last.values) > 1:
-            return last.values
-        return None
+        if not (last and last.values and len(last.values) > 1):
+            return None
+        state = dict(last.values)
+        # 注入 target 覆盖（让"已完成2集"后继续跑到新目标3集）
+        if target_override is not None:
+            state["target_episode_count"] = target_override
+            # 关键：重置路由入口，让图从 text_chunker 重新启动主循环
+            # loop_finished 保持原值；pending_scenes 保留以聚合为下一集
+        return state
     except Exception:
         return None
 
@@ -99,14 +109,31 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
 
     # 加载或初始化状态
     if resume:
-        state = _resume_state(graph, thread_id)
+        # 续跑时用 config 的 target 覆盖断点内 target（支持"加集"场景）
+        cfg_target = cfg.run.target_episode_count
+        state = _resume_state(graph, thread_id, target_override=cfg_target)
         if state:
-            print(f"[续跑] 加载断点状态成功，offset={state.get('offset',0)}，已完成 {state.get('completed_episode_count',0)} 集")
+            done = state.get("completed_episode_count", 0)
+            # 检测断点是否已 END（next 为空）：此时传 None 不会继续，需要全新输入
+            snap = list(graph.get_state_history(config))
+            is_finished = bool(snap) and snap[0].next == ()
+            if is_finished:
+                print(f"[续跑] 旧断点已结束（已完成{done}集），注入新目标 {cfg_target}，从 offset={state.get('offset',0)} 续跑")
+                # 用新 thread_id 续跑，避免和旧 END 状态冲突
+                thread_id = "novel_main_thread_resume_%d" % done
+                config = {"configurable": {"thread_id": thread_id}}
+                # state 作为全新输入传入（不走 None 恢复）
+                input_state = state
+            else:
+                print(f"[续跑] 加载断点状态，offset={state.get('offset',0)}，已完成 {done} 集")
+                input_state = None
         else:
             print("[续跑] 未找到断点，全新启动")
             state = _initial_state(novel_path, target)
+            input_state = state
     else:
         state = _initial_state(novel_path, target)
+        input_state = state
         print(f"[启动] 全新任务，目标集数: {target if target else '全本'}")
 
     # 初始化记忆 Agent（首次运行建立空记忆库）
@@ -117,8 +144,6 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
     print("=" * 60)
     print("进入主生产循环...")
     try:
-        # 断点续跑：stream 传 None，由 checkpointer 恢复；全新：传 state
-        input_state = None if resume and state else state
         for output in graph.stream(input_state, config=config, stream_mode="updates"):
             for node_name, update in output.items():
                 # 汇报进度
