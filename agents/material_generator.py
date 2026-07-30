@@ -60,8 +60,9 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
    - 灵体角色不受古风服饰/发饰约束，但形态必须忠于档案的 appearance 描述
    - 严禁把薪火画成普通肉体小童（不能有真实皮肤肉体感、不能穿普通衣服）
 
-【画面风格要求（中国古代神话·防穿帮约束）】
-所有生图 Prompt 必须以 'ancient Chinese mythology art style, ' 开头：
+【画面风格要求（中国古代神话·动漫风格·防穿帮约束）】
+所有生图 Prompt 必须以 'anime style, ancient Chinese mythology art style, ' 开头：
+- 默认动漫风格：精致手绘动漫画风、清晰线稿、饱和色彩、动漫人物比例（非写实照片感）
 - 中国古代神话风格，古朴、蛮荒、磅礴，洪荒神话感
 - 男性角色英俊帅气、五官立体、身姿挺拔；女性角色美丽动人、气质出尘
 - 体态/尺寸明确（最高优先级·防穿帮）：
@@ -98,7 +99,7 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
       "narration_segment": "对应 tts_meta 的第几段（整数）",
       "start_ratio": "0.0-1.0 浮点（该图在所属语音段中的出现进度位置）",
       "characters": ["本图涉及角色 char_id 列表"],
-      "prompt": "以 'ancient Chinese mythology art style, ' 开头的生图Prompt，必须包含：(1) 风格前缀 (2) 人物固定外貌——age/identity/appearance发色发型/眼/眉/身材/五官（100%沿用档案不得改变）/attire穿着 (3) 精确动作与表情 (4) 场景环境 (5) 关键视觉特征精确写出 (6) 神话氛围光影 (7) 镜头构图。观想/幻象场景必须同时画主角真实外貌+虚意象，标注为 illusion/vision。同一人物所有图外貌完全一致",
+      "prompt": "以 'anime style, ancient Chinese mythology art style, ' 开头的生图Prompt，必须包含：(1) 风格前缀（默认动漫风格）(2) 人物固定外貌——age/identity/appearance发色发型/眼/眉/身材/五官（100%沿用档案不得改变）/attire穿着 (3) 精确动作与表情 (4) 场景环境 (5) 关键视觉特征精确写出 (6) 神话氛围光影 (7) 镜头构图。观想/幻象场景必须同时画主角真实外貌+虚意象，标注为 illusion/vision。同一人物所有图外貌完全一致",
       "mood": "本画面情绪关键词"
     }}
   ],
@@ -108,7 +109,7 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
       "text": "本段朗读文本",
       "voice": "角色名（钟岳/薪火/narrator），旁白用 narrator",
       "emotion": "neutral | excited | sad | tense | calm | angry | surprised",
-      "speed": "0.8-1.2 浮点",
+      "speed": "1.0-1.2 浮点（默认1.08，稍快紧凑）",
       "pause_after": "段后停顿 0.0-2.0 秒"
     }}
   ]
@@ -117,7 +118,7 @@ SYSTEM_PROMPT = """你是中国古代神话题材短视频多媒体素材生成�
 严格要求：
 1. 文案必须对标"小说速读字幕"风格：顺时间线密集推进、短句为主、第三人称客观概括，严禁说书腔调和套话（见【讲解文案风格要求】），原文浓缩而非逐句复述（400-800字）
 2. 人物一致性：生图 Prompt 人物外貌 100% 沿用档案，年龄/发型/体型/五官不得改变；观想意象不得画成人物本人变貌
-3. 生图 Prompt 必须以 'ancient Chinese mythology art style, ' 开头，且衣着/发饰/鞋履/配饰必须 100% 古代（见【画面风格要求·防穿帮约束】）
+3. 生图 Prompt 必须以 'anime style, ancient Chinese mythology art style, ' 开头（默认动漫风格），且衣着/发饰/鞋履/配饰必须 100% 古代（见【画面风格要求·防穿帮约束】）
 4. 关键视觉特征精确描述，不用模糊词
 5. 图片数 ≥ TTS段数，每10秒至少一张图
 6. 每个 image_prompt 必须有 narration_segment 和 start_ratio

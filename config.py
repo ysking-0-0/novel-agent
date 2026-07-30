@@ -79,7 +79,7 @@ class MediaConfig:
     # 图片宽高比
     image_aspect_ratio: str = os.getenv("IMAGE_ASPECT_RATIO", "16:9")
     # 视频分辨率（与图片比例匹配）
-    video_resolution: str = os.getenv("VIDEO_RESOLUTION", "1280x720")
+    video_resolution: str = os.getenv("VIDEO_RESOLUTION", "1920x1080")
     # 视频帧率
     video_fps: int = int(os.getenv("VIDEO_FPS", "30"))
     # 单幅图片展示目标时长（秒），material_generator 据此估算图片数量
@@ -87,8 +87,10 @@ class MediaConfig:
     image_duration_target: float = float(os.getenv("IMAGE_DURATION_TARGET", "10.0"))
     # 背景音乐文件路径（None=不加BGM）。BGM 会被循环/截断对齐视频时长，音量降低做背景
     bgm_path: str = os.getenv("BGM_PATH", "./assets/bgm.mp3")
-    # BGM 音量（0.0-1.0，相对TTS为1.0）。0.15 表示BGM声压约为TTS的15%
-    bgm_volume: float = float(os.getenv("BGM_VOLUME", "0.15"))
+    # BGM 音量（0.0-1.0，相对TTS为1.0）。0.25 表示BGM声压约为TTS的25%
+    bgm_volume: float = float(os.getenv("BGM_VOLUME", "0.25"))
+    # TTS 音量增益（1.0=原始，>1放大）。合成时对 TTS 音轨统一施加该增益
+    tts_volume: float = float(os.getenv("TTS_VOLUME", "1.25"))
     # 角色音色映射：tts_meta.voice 值（角色名/旁白标识）→ MiniMax voice_id
     # 可用 voice_id（MiniMax）：
     #   Chinese_gravelly_storyteller_nv1（中文沉稳旁白/说书人，沙哑磁性）

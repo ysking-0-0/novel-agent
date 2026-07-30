@@ -30,7 +30,7 @@
     "image_model": "image-01",
     "tts_model": "speech-02-hd",
     "image_aspect_ratio": "16:9",
-    "video_resolution": "1280x720",
+    "video_resolution": "1920x1080",
     "video_fps": 30,
     "voice_mapping": {
       "narrator": "Chinese_gravelly_storyteller_nv1",
@@ -42,6 +42,7 @@
     "default_voice_id": "Chinese_gravelly_storyteller_nv1",
     "image_duration_target": 10.0,
     "bgm_path": "./assets/bgm.mp3",
-    "bgm_volume": 0.15
+    "bgm_volume": 0.25,
+    "tts_volume": 1.25
   }
 }

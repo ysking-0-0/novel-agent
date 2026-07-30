@@ -82,8 +82,10 @@ def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None) -> O
                     return urls[0]
                 br = d.get("base_resp") or {}
                 msg = (br.get("status_msg") or "")[:80]
-                if "用量" in msg or "limit" in msg.lower():
-                    print("    [生图] 用量受限，跳过: %s" % msg)
+                status_code = br.get("status_code")
+                # 用量受限 / 内容审核敏感：直接放弃不重试（重试只会重复失败并占满超时）
+                if "用量" in msg or "limit" in msg.lower() or status_code in (1026, 1027):
+                    print("    [生图] 跳过(status=%s): %s" % (status_code, msg or "sensitive/quota"))
                     return None
         except Exception as e:
             print("    [生图] attempt %d 异常: %s" % (attempt, e))
@@ -350,8 +352,10 @@ def _call_tts_api(text: str, voice_id: str, emotion: str, speed: float) -> Optio
                     return _decode_audio(audio_raw)
                 br = d.get("base_resp") or {}
                 msg = (br.get("status_msg") or "")[:80]
-                if "用量" in msg or "limit" in msg.lower():
-                    print("    [TTS] 用量受限: %s" % msg)
+                status_code = br.get("status_code")
+                # 用量受限 / 内容审核敏感：直接放弃不重试
+                if "用量" in msg or "limit" in msg.lower() or status_code in (1026, 1027):
+                    print("    [TTS] 跳过(status=%s): %s" % (status_code, msg or "sensitive/quota"))
                     return None
                 # voice_id "not exist" 在并发时多为限流误报，退避重试而非换音色
                 if "voice" in msg.lower() or "not exist" in msg.lower():
@@ -451,7 +455,7 @@ def generate_tts(tts_meta: List[Dict], ep_dir: str) -> List[Optional[str]]:
         audio = _call_tts_api(
             text, voice_id,
             m.get("emotion", "neutral"),
-            float(m.get("speed", 1.0)),
+            float(m.get("speed", 1.08)),
         )
         if not audio:
             return idx, None
@@ -578,9 +582,9 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
 
     vf = (
         "scale=%d:%d:flags=lanczos,"           # 放大到 W x (H*1.176*4)
-        "setsar=1,"
         "crop=%d:%d:0:'%s',"                   # 在放大域按 t 移动(整数)
         "scale=%d:%d:flags=lanczos,"           # 缩回原始 W x H
+        "setsar=1,"                            # 重置SAR(必须在最后一次scale后,否则残留放大比值)
         "format=yuv420p"
     ) % (W, img_h_up, W, win_h_up, y_expr, W, H)
 
@@ -715,13 +719,17 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
     # 注意：视频必须重编码（-c:v libx264），不能用 copy，否则 zoompan 动效帧时间戳会错乱
     cfg = get_config()
     bgm = cfg.media.bgm_path
+    tts_gain = getattr(cfg.media, "tts_volume", 1.0)
+    amix_filter = (
+        "[0:a]volume=%.2f[tts];[1:a]volume=%.2f[bg];[tts][bg]amix=inputs=2:duration=first:dropout_transition=0[a]"
+        % (tts_gain, cfg.media.bgm_volume)
+    )
     if bgm and os.path.exists(bgm):
         try:
             subprocess.run(
                 [exe, "-y", "-i", concat_out,
                  "-stream_loop", "-1", "-i", bgm,
-                 "-filter_complex",
-                 "[1:a]volume=%.2f[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]" % cfg.media.bgm_volume,
+                 "-filter_complex", amix_filter,
                  "-map", "0:v", "-map", "[a]",
                  "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0", "-c:a", "aac",
                  "-r", str(cfg.media.video_fps), "-shortest", out],
@@ -732,8 +740,7 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
                 subprocess.run(
                     [exe, "-y", "-i", concat_out,
                      "-stream_loop", "-1", "-i", bgm,
-                     "-filter_complex",
-                     "[1:a]volume=%.2f[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[a]" % cfg.media.bgm_volume,
+                     "-filter_complex", amix_filter,
                      "-map", "0:v", "-map", "[a]",
                      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0", "-c:a", "aac",
                      "-r", str(cfg.media.video_fps), "-shortest", out],
