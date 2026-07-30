@@ -98,6 +98,12 @@ class MediaConfig:
     bgm_volume: float = float(os.getenv("BGM_VOLUME", "0.25"))
     # TTS 音量增益（1.0=原始，>1放大）。合成时对 TTS 音轨统一施加该增益
     tts_volume: float = float(os.getenv("TTS_VOLUME", "1.25"))
+    # 是否在视频上烧录字幕（从 tts_meta 文本生成 SRT，drawtext 渲染）
+    enable_subtitles: bool = os.getenv("ENABLE_SUBTITLES", "false").lower() == "true"
+    # 字幕字体大小（像素，相对于 1080p 高度）
+    subtitle_font_size: int = int(os.getenv("SUBTITLE_FONT_SIZE", "42"))
+    # 字幕字体文件路径（空=自动探测系统 CJK 字体；也可手动指定 ttf/ttc 路径）
+    subtitle_font: str = os.getenv("SUBTITLE_FONT", "")
     # 角色音色映射：tts_meta.voice 值（角色名/旁白标识）→ MiniMax voice_id
     # 可用 voice_id（MiniMax）：
     #   Chinese_gravelly_storyteller_nv1（中文沉稳旁白/说书人，沙哑磁性）

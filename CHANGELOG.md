@@ -45,6 +45,13 @@
 - 新增 `_retry_generate_images()`：对失败图/缺图单独重试一轮
 - 占位图颜色从深蓝 `0x1a1a2e` 改为亮灰 `0x404050`，便于区分真实黑屏
 - 黑屏检测阈值从 0.5% 提到 5%；超阈值时自动定位缺图/占位图→重试生图→重新合成视频
+- **Ken Burns 纯色帧修复**：crop 的 y 坐标加 `clip()` 钳制，防止音频时长估算不准时 y 越界导致灰屏（即使所有图都正常也会出现）
+
+#### 4. 字幕烧录（`nodes/media_synthesizer.py`）
+- 新增 `generate_srt()`：从 tts_meta 文本 + 音频时长生成 SRT 字幕文件（`output/ep_xxx/subtitles.srt`）
+- `compose_video` 最终输出阶段用 FFmpeg `subtitles` 滤镜烧录（白字黑描边、底部居中）
+- 配置开关：`media.enable_subtitles`（默认 false）+ `subtitle_font_size`（42）+ `subtitle_font`（`./assets/fonts/msyh.ttc` 微软雅黑）
+- Gradio UI 加「字幕（烧录到视频）」复选框
 
 ### 变更
 
@@ -67,6 +74,10 @@
 - **日志不回流**：子进程加 `env["PYTHONUNBUFFERED"]="1"`
 - **SAR 残留**：`setsar=1` 移到最后一次 scale 后
 - **审核跳过**：`_call_image_api` / `_call_tts_api` 对 status_code 1026/1027 直接 return None，不重试
+- **续跑读旧断点**：`_find_latest_thread_id()` 扫描所有 `novel_main_thread*` thread，选已完成集数最多的续跑（旧版固定读 `novel_main_thread` 导致读到 done=1 的旧断点）
+- **续跑 target 被忽略**：续跑时 `--target` 优先于 config.json 的 `target_episode_count`（旧版忽略命令行参数）
+- **覆盖生成旧文件残留**：`generate_images`/`generate_tts`/`media_synthesizer_node` 开头清理旧 images/audio/mp4，避免索引错位
+- **无缺图时的灰屏**：Ken Burns crop 的 y 坐标加 `clip()` 钳制，防止 `t` 超出 `safe_dur` 时 y 越界导致纯色填充帧
 
 ### 使用方法
 

@@ -54,6 +54,39 @@ def _initial_state(novel_path: str, target: int = None) -> Dict[str, Any]:
     }
 
 
+def _find_latest_thread_id(graph) -> str:
+    """扫描所有 novel_main_thread* 的 thread，返回已完成集数最多的那个 thread_id。
+    每次续跑 END 后会创建 novel_main_thread_resume_N，需要找最新的。
+    """
+    import sqlite3
+    try:
+        db_path = get_config().storage.sqlite_path
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE 'novel_main_thread%'"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return "novel_main_thread"
+        best_tid = "novel_main_thread"
+        best_done = -1
+        for (tid,) in rows:
+            try:
+                snaps = list(graph.get_state_history(
+                    {"configurable": {"thread_id": tid}}
+                ))
+                if snaps:
+                    done = snaps[0].values.get("completed_episode_count", 0) if snaps[0].values else 0
+                    if isinstance(done, int) and done > best_done:
+                        best_done = done
+                        best_tid = tid
+            except Exception:
+                pass
+        return best_tid
+    except Exception:
+        return "novel_main_thread"
+
+
 def _resume_state(graph, thread_id: str, target_override: int = None) -> Dict[str, Any] | None:
     """尝试从 SqliteSaver 读取断点状态。
 
@@ -109,23 +142,38 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
 
     # 加载或初始化状态
     if resume:
-        # 续跑时用 config 的 target 覆盖断点内 target（支持"加集"场景）
-        cfg_target = cfg.run.target_episode_count
-        state = _resume_state(graph, thread_id, target_override=cfg_target)
+        # 续跑时找已完成集数最多的 thread（每次 END 后会创建 novel_main_thread_resume_N）
+        latest_tid = _find_latest_thread_id(graph)
+        if latest_tid != thread_id:
+            print(f"[续跑] 检测到最新断点 thread: {latest_tid}")
+            thread_id = latest_tid
+            config = {"configurable": {"thread_id": thread_id}}
+        # 续跑时 target 语义为"增量"：已完成4集 + --target 1 = 跑到第5集
+        # 命令行 --target 优先，未指定则用 config.json 的值
+        if target is not None:
+            target_increment = target
+        else:
+            target_increment = cfg.run.target_episode_count
+        state = _resume_state(graph, thread_id, target_override=None)  # 先读原始状态，不加 target
         if state:
             done = state.get("completed_episode_count", 0)
+            # 增量转绝对值：已完成数 + 增量
+            target_override = done + target_increment
+            state["target_episode_count"] = target_override
             # 检测断点是否已 END（next 为空）：此时传 None 不会继续，需要全新输入
             snap = list(graph.get_state_history(config))
             is_finished = bool(snap) and snap[0].next == ()
             if is_finished:
-                print(f"[续跑] 旧断点已结束（已完成{done}集），注入新目标 {cfg_target}，从 offset={state.get('offset',0)} 续跑")
+                print(f"[续跑] 旧断点已结束（已完成{done}集），追加 {target_increment} 集→新目标 {target_override}，从 offset={state.get('offset',0)} 续跑")
                 # 用新 thread_id 续跑，避免和旧 END 状态冲突
                 thread_id = "novel_main_thread_resume_%d" % done
                 config = {"configurable": {"thread_id": thread_id}}
                 # state 作为全新输入传入（不走 None 恢复）
                 input_state = state
             else:
-                print(f"[续跑] 加载断点状态，offset={state.get('offset',0)}，已完成 {done} 集")
+                print(f"[续跑] 加载断点状态（已完成{done}集），追加 {target_increment} 集→新目标 {target_override}，offset={state.get('offset',0)}")
+                # 未 END：用 update_state 注入新 target，再 stream(None) 续跑
+                graph.update_state(config, {"target_episode_count": target_override})
                 input_state = None
         else:
             print("[续跑] 未找到断点，全新启动")

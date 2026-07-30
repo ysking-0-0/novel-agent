@@ -69,7 +69,8 @@ def _build_run_cmd(novel_path, target, art_style, orientation, tts_speed,
     return cmd
 
 
-def _apply_runtime_config(art_style, orientation, tts_speed, bgm_volume, tts_volume):
+def _apply_runtime_config(art_style, orientation, tts_speed, bgm_volume, tts_volume,
+                          enable_subtitles=False):
     """把 UI 参数写入 config.json（运行时覆盖），让 main.py 加载时生效。"""
     cfg_path = "config.json"
     if not os.path.exists(cfg_path):
@@ -86,6 +87,7 @@ def _apply_runtime_config(art_style, orientation, tts_speed, bgm_volume, tts_vol
         media["video_resolution"] = "1080x1920"
     media["bgm_volume"] = float(bgm_volume)
     media["tts_volume"] = float(tts_volume)
+    media["enable_subtitles"] = bool(enable_subtitles)
     # tts_speed 写入 run 段（material_generator 从 tts_meta.speed 读，这里改默认值无直接通道，
     # 实际 speed 由 material_generator prompt 控制；此处仅记录供参考）
     with open(cfg_path, "w", encoding="utf-8") as f:
@@ -95,7 +97,7 @@ def _apply_runtime_config(art_style, orientation, tts_speed, bgm_volume, tts_vol
 
 def start_production(novel_file, target, art_style, orientation,
                      tts_speed, bgm_volume, tts_volume, chunk_size, max_retries,
-                     resume=False):
+                     enable_subtitles=False, resume=False):
     """启动生产进程。resume=True 时从断点续跑（忽略新上传文件）。"""
     import traceback as _tb
     _log_file("start_production 被调用，参数: novel_file=%r type=%s target=%s",
@@ -133,12 +135,19 @@ def start_production(novel_file, target, art_style, orientation,
                     _RUN.is_running = False
                 return f"❌ 无法定位上传文件（type={type(novel_file).__name__}, val={novel_file!r:.80}）", []
         else:
-            with _RUN.lock:
-                _RUN.is_running = False
-            return "❌ 请先上传小说 TXT 文件", []
+            # 未上传新文件：尝试复用 data/novel.txt
+            cached = os.path.join("data", "novel.txt")
+            if os.path.exists(cached):
+                novel_path = cached
+                sz_mb = os.path.getsize(novel_path) / 1024 / 1024
+                _RUN.log_lines.append(f"[复用] 使用已有文件 {novel_path} ({sz_mb:.1f} MB)")
+            else:
+                with _RUN.lock:
+                    _RUN.is_running = False
+                return "❌ 请先上传小说 TXT 文件（首次运行必须上传）", []
 
         err = _apply_runtime_config(art_style, orientation, tts_speed,
-                                     bgm_volume, tts_volume)
+                                     bgm_volume, tts_volume, enable_subtitles)
         if err:
             with _RUN.lock:
                 _RUN.is_running = False
@@ -149,7 +158,7 @@ def start_production(novel_file, target, art_style, orientation,
                              resume=resume)
         _RUN.log_lines.append(f"[启动] 命令: {' '.join(cmd)}")
         _RUN.log_lines.append(f"[参数] 风格={art_style} 方向={orientation} "
-                              f"BGM={bgm_volume} TTS音量={tts_volume} 续跑={resume}")
+                              f"BGM={bgm_volume} TTS音量={tts_volume} 字幕={enable_subtitles} 续跑={resume}")
         _log_file("启动命令: %s", ' '.join(cmd))
 
         def _run_process():
@@ -187,18 +196,18 @@ def start_production(novel_file, target, art_style, orientation,
 
 
 def resume_production(art_style, orientation, tts_speed, bgm_volume, tts_volume,
-                      chunk_size, max_retries, target):
+                      chunk_size, max_retries, target, enable_subtitles=False):
     """从断点续跑：复用上次的 offset/pending_scenes/已完成集数。"""
     # target 仍可覆盖（支持"已完成4集，再追加2集"）
     return start_production(
         None, target, art_style, orientation,
         tts_speed, bgm_volume, tts_volume, chunk_size, max_retries,
-        resume=True,
+        enable_subtitles=enable_subtitles, resume=True,
     )
 
 
 def stop_production():
-    """停止生产进程。"""
+    """停止生成进程。"""
     with _RUN.lock:
         if not _RUN.is_running or _RUN.process is None:
             return "⚠️ 无运行中的任务"
@@ -220,9 +229,9 @@ def refresh_log():
 def refresh_status():
     """刷新运行状态。"""
     if _RUN.is_running:
-        return "🟢 运行中", gr.update(variant="danger", value="⏹️ 停止生产")
+        return "🟢 运行中", gr.update(variant="danger", value="⏹️ 停止生成")
     else:
-        return "⚪ 空闲", gr.update(variant="primary", value="▶️ 开始生产")
+        return "⚪ 空闲", gr.update(variant="primary", value="▶️ 开始生成")
 
 
 def refresh_status_simple():
@@ -347,7 +356,8 @@ def build_ui():
                     gr.Markdown("### ① 任务配置")
                     novel_input = gr.File(label="上传小说 TXT（支持大文件，≤500MB）",
                                           file_types=[".txt"], type="filepath")
-                    target_input = gr.Number(label="目标集数", value=4, precision=0)
+                    target_input = gr.Number(label="目标集数", value=4, precision=0,
+                                              info="全新运行=总集数；续跑=追加几集（如已完成4集+填1→跑到第5集）")
                     art_style_dd = gr.Dropdown(
                         choices=["anime", "realistic"],
                         value="anime", label="生图风格",
@@ -363,11 +373,12 @@ def build_ui():
                                            label="BGM 音量")
                     tts_vol_sl = gr.Slider(0.8, 2.0, value=1.25, step=0.05,
                                           label="TTS 音量增益")
+                    subtitle_cb = gr.Checkbox(label="字幕（烧录到视频）", value=False)
                     chunk_input = gr.Number(label="分片字符数", value=8000, precision=0)
                     retries_input = gr.Number(label="单集最大重试", value=2, precision=0)
-                    start_btn = gr.Button("▶️ 开始生产", variant="primary")
+                    start_btn = gr.Button("▶️ 开始生成", variant="primary")
                     resume_btn = gr.Button("♻️ 从断点续跑", variant="secondary")
-                    stop_btn = gr.Button("⏹️ 停止生产", variant="stop")
+                    stop_btn = gr.Button("⏹️ 停止生成", variant="stop")
 
                 with gr.Column(scale=1):
                     gr.Markdown("### ② 实时进度")
@@ -386,14 +397,14 @@ def build_ui():
                         fn=start_production,
                         inputs=[novel_input, target_input, art_style_dd, orient_dd,
                                 tts_speed_dd, bgm_vol_sl, tts_vol_sl,
-                                chunk_input, retries_input],
+                                chunk_input, retries_input, subtitle_cb],
                         outputs=[status_box, start_feedback],
                     )
                     resume_btn.click(
                         fn=resume_production,
                         inputs=[art_style_dd, orient_dd, tts_speed_dd,
                                 bgm_vol_sl, tts_vol_sl, chunk_input, retries_input,
-                                target_input],
+                                target_input, subtitle_cb],
                         outputs=[status_box, start_feedback],
                     )
                     stop_btn.click(fn=stop_production, outputs=status_box)
