@@ -13,3 +13,5 @@ sqlalchemy==2.0.36
 requests>=2.31
 imageio-ffmpeg>=0.5
 Pillow>=10.0
+# Gradio 控制台（app.py）
+gradio>=4.0

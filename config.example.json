@@ -17,9 +17,9 @@
     "max_scenes_per_episode": 8
   },
   "storage": {
-    "output_dir": "./output",
-    "sqlite_path": "./checkpoints/checkpoint.sqlite",
-    "memory_dir": "./memory",
+    "output_dir": "",
+    "sqlite_path": "",
+    "memory_dir": "",
     "enable_vector_retrieval": true,
     "vector_dim": 1536
   },

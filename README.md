@@ -3,6 +3,7 @@
 基于 **LangGraph 状态机** 的长篇小说（百万字级）批量拆解生产系统：从纯文本小说自动拆解为可直接用于短视频制作的多媒体素材包，**端到端产出讲解视频**（口播文案 → 语音合成 → AI 配图 → FFmpeg 拼接成片）。
 
 > 设计文档：`任务文档.md`（阶段二完整版，9 个 LLM Agent + 7 个纯代码节点）
+> 更新日志：`CHANGELOG.md`（版本变化记录与使用说明）
 
 ## 系统架构
 
@@ -214,6 +215,8 @@ SqliteSaver 自动保存每个节点完成后的完整 NovelState 快照（threa
 
 ## 快速开始
 
+本系统提供两种使用方式：**Gradio Web 控制台**（推荐，鼠标点选全流程）与**命令行**（脚本化批量跑）。
+
 ### 0. 你需要准备什么
 
 运行本系统**只需要两样东西**：
@@ -233,7 +236,7 @@ cd novel-agent          # 项目根目录（即本仓库）
 pip install -r requirements.txt
 ```
 
-依赖清单（requirements.txt）：`langchain-openai`、`langgraph`、`langgraph-checkpoint-sqlite`、`requests`、`Pillow`、`imageio-ffmpeg`、`faiss-cpu` 等。Python 3.11+。
+依赖清单（requirements.txt）：`langchain-openai`、`langgraph`、`langgraph-checkpoint-sqlite`、`requests`、`Pillow`、`imageio-ffmpeg`、`faiss-cpu`、**`gradio>=4.0`**（Web 控制台）等。Python 3.11+。
 
 ### 2. 配置 API Key（二选一）
 
@@ -248,11 +251,38 @@ cp config.example.json config.json
 ```
 然后编辑 `config.json`，至少把 `model.api_key` 改成你的真实 key。config.json 已在 .gitignore 中，不会被提交。
 
-> 还可在 config.json 里改：模型名（默认 MiniMax-M2.7-highspeed）、音色映射、视频分辨率（默认 1280x720）、目标集数等。详见下方「配置参数」表。
+> 还可在 config.json 里改：模型名（默认 MiniMax-M2.7-highspeed）、音色映射、视频分辨率（默认 1920x1080）、目标集数等。详见下方「配置参数」表。
 
-### 3. 放入小说文本
+### 3-A. 方式一：Gradio Web 控制台（推荐）
 
-把你的小说 txt 放到任意位置，默认约定放 `./data/novel.txt`：
+无需预先放小说文件——直接启动服务，在浏览器里完成上传→设参→生产→预览→改 prompt 全流程。
+
+```bash
+python app.py --config config.json --port 7860
+```
+
+浏览器打开 `http://127.0.0.1:7860`，看到四个标签页/区块：
+
+| 区块 | 功能 |
+|---|---|
+| ① 任务配置 | 上传小说 TXT（≤500MB）设目标集数/风格/方向/音量等，点 ▶️ 开始生产 |
+| ② 实时进度 | 运行状态灯 + 日志流（每 2 秒自动刷新） |
+| ③ 成品浏览 | 选集下拉 → 视频预览（520px 高）+ 讲解文案 + 生图 Prompt |
+| ④ 提示词管理 | 选 Agent → 加载/编辑/保存其 `prompts/*.md`，下一集即时生效 |
+
+可选参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--config` | `config.json` | 配置文件 |
+| `--port` | `7860` | 服务端口 |
+| `--share` | 关 | 生成 gradio.live 公网临时链接（方便手机/远程访问） |
+
+> 提示词在线编辑：`material_generator.md` 中的 `{{ART_STYLE}}` 占位符运行时按风格下拉（anime / realistic）自动替换，无需手写。
+
+### 3-B. 方式二：命令行
+
+先把小说 txt 放到默认位置：
 
 ```bash
 mkdir -p data
@@ -260,8 +290,6 @@ cp /你的小说路径/某小说.txt data/novel.txt
 ```
 
 > 也支持放别处，运行时用 `--novel /你的路径.txt` 指定即可。文件越完整越好（几万字起步，百万字也行）；太短（<几千字）可能凑不够一集（系统要求每集至少 3 个场景）。
-
-### 4. 运行（一行命令出视频）
 
 **最简：生成 10 集视频**
 ```bash
@@ -320,11 +348,22 @@ checkpoints/
 
 ```
 novel_pipeline/
-├── requirements.txt          # 依赖
+├── requirements.txt          # 依赖（含 gradio>=4.0）
 ├── config.py                 # 全局配置（model/run/storage/media 四组）
 ├── config.example.json       # 示例配置文件
 ├── llm_factory.py             # LLM 实例工厂（按角色分层实例化）
 ├── state.py                  # NovelState 核心状态定义
+├── app.py                    # ★ Gradio Web 控制台入口
+├── prompts/                  # ★ 8 个 Agent 的外部化 System Prompt
+│   ├── __init__.py           # 加载器（load_prompt / save_prompt / list_prompts）
+│   ├── plot_parser.md
+│   ├── episode_aggregator.md
+│   ├── material_generator.md # 含 {{ART_STYLE}} 占位符
+│   ├── review_character.md
+│   ├── review_foreshadow.md
+│   ├── review_timeline.md
+│   ├── review_atmosphere.md
+│   └── review_arbiter.md
 ├── agents/                   # 9 个 LLM 智能 Agent
 │   ├── memory_manager.py     # 支撑层：全局记忆管理（人物/事件/伏笔 + FAISS）
 │   ├── plot_parser.py        # 生产层：剧情解析
@@ -345,7 +384,7 @@ novel_pipeline/
 │   └── retry_counter.py      # 重试计数
 ├── graph/
 │   └── builder.py            # LangGraph StateGraph 构建 + SqliteSaver
-└── main.py                   # 主入口
+└── main.py                   # 命令行主入口
 ```
 
 ## 配置参数
@@ -370,7 +409,7 @@ novel_pipeline/
 | media.tts_model | `TTS_MODEL` | speech-02-hd | TTS 模型 |
 | media.image_concurrency | `IMAGE_CONCURRENCY` | 3 | 生图并发数 |
 | media.tts_concurrency | `TTS_CONCURRENCY` | 1 | TTS 并发数（限流敏感） |
-| media.video_resolution | `VIDEO_RESOLUTION` | 1280x720 | 视频分辨率 |
+| media.video_resolution | `VIDEO_RESOLUTION` | 1920x1080 | 视频分辨率 |
 | media.video_fps | `VIDEO_FPS` | 30 | 视频帧率 |
 | media.image_aspect_ratio | `IMAGE_ASPECT_RATIO` | 16:9 | 生图宽高比 |
 | media.voice_mapping | - | 见 config.example.json | voice 字段 → MiniMax voice_id（默认：narrator→Chinese_gravelly_storyteller_nv1，女性→Chinese (Mandarin)_Sweet_Lady，钟岳→Chinese_worker_male）|
@@ -389,6 +428,7 @@ novel_pipeline/
 | 向量检索 | FAISS (faiss-cpu) | 长线伏笔召回 |
 | 状态持久化 | SQLite (LangGraph Checkpointer) | 断点快照 |
 | HTTP | requests | 生图/TTS 接口调用 |
+| Web 控制台 | Gradio (gradio>=4.0) | 浏览器界面上传/设参/预览/改 prompt |
 | 语言 | Python 3.11+ | - |
 
 ## 实现状态
@@ -403,6 +443,9 @@ novel_pipeline/
 - ✅ 多媒体合成闭环：定妆照参考 → AI 生图（中国古代神话风格）→ TTS（三音色映射）→ FFmpeg 视频拼接
 - ✅ 细粒度图片：每个场景/动作对应一张图（narration_segment 标注归属语音段），图片数 > 语音段数，同段多图均分音频时长展示
 - ✅ 端到端实跑验证：ep_001 产出 4 图 + 1 段语音 + 37.8 秒讲解视频 (1.9MB)
+- ✅ Gradio Web 控制台：上传/设参/实时日志/成品预览/提示词在线编辑
+- ✅ 8 个 Agent 提示词外部化到 `prompts/*.md`，支持风格切换（`{{ART_STYLE}}` 占位符）
+- ✅ 黑屏自动修复：检测到黑屏帧自动重试缺图/占位图并重新合成视频
 
 ## 注意事项
 

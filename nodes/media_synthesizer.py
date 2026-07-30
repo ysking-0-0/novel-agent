@@ -301,6 +301,63 @@ def generate_images(episode: Dict, prompts: List[str], ep_dir: str) -> List[Opti
     return results
 
 
+def _retry_generate_images(episode: Dict, retry_items: List, ep_dir: str) -> Dict:
+    """对失败的图单独重试一轮（可能是临时网络/DNS 抖动）。
+    retry_items: [(idx, prompt_item), ...]
+    返回 {idx: path} 成功的。
+    """
+    cfg = get_config()
+    img_dir = os.path.join(ep_dir, "images")
+    os.makedirs(img_dir, exist_ok=True)
+
+    # 收集角色定妆照（复用已有）
+    char_portraits: Dict[str, str] = {}
+    for cid, info in _collect_characters(episode).items():
+        p = get_or_create_portrait(cid, info.get("desc", cid), info.get("entity_type", "human"))
+        if p:
+            char_portraits[cid] = p
+    portrait_b64: Dict[str, str] = {}
+    for cid, path in char_portraits.items():
+        b64 = _image_to_base64(path)
+        if b64:
+            portrait_b64[cid] = b64
+    primary_ref_b64: Optional[str] = next(iter(portrait_b64.values()), None) if portrait_b64 else None
+
+    def _match_ref(prompt_item) -> Optional[str]:
+        if not portrait_b64:
+            return None
+        char_list = prompt_item.get("characters", []) if isinstance(prompt_item, dict) else []
+        for cid in char_list:
+            if cid in portrait_b64:
+                return portrait_b64[cid]
+        prompt_text = prompt_item.get("prompt", "") if isinstance(prompt_item, dict) else str(prompt_item)
+        for cid in portrait_b64:
+            if cid in prompt_text:
+                return portrait_b64[cid]
+        return primary_ref_b64
+
+    results: Dict[int, str] = {}
+    def _one(idx_prompt):
+        idx, prompt = idx_prompt
+        prompt_text = prompt.get("prompt") if isinstance(prompt, dict) else str(prompt)
+        ref_b64 = _match_ref(prompt)
+        url = _call_image_api(prompt_text, reference_image_b64=ref_b64)
+        if not url:
+            return idx, None
+        dest = os.path.join(img_dir, "%03d.png" % idx)
+        if _download(url, dest):
+            return idx, dest
+        return idx, None
+
+    with ThreadPoolExecutor(max_workers=cfg.media.image_concurrency) as pool:
+        futs = {pool.submit(_one, item): item[0] for item in retry_items}
+        for fut in as_completed(futs):
+            idx, path = fut.result()
+            if path:
+                results[idx] = path
+    return results
+
+
 # ────────────── TTS ──────────────
 def _decode_audio(audio_str: str) -> bytes:
     """MiniMax T2A 返回的 audio 字段可能是 hex 或 base64，自适应解码。
@@ -533,9 +590,10 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
         placeholder = os.path.join(tmp_dir, "placeholder.png")
         if not os.path.exists(placeholder):
             w, h = resolution.split("x")
+            # 亮灰色占位（0x404050），与黑屏检测阈值区分，便于识别缺图位置
             subprocess.run(
                 [exe, "-y", "-f", "lavfi", "-i",
-                 "color=c=0x1a1a2e:s=%dx%d:d=1" % (int(w), int(h)),
+                 "color=c=0x404050:s=%dx%d:d=1" % (int(w), int(h)),
                  "-frames:v", "1", placeholder],
                 capture_output=True, timeout=30,
             )
@@ -807,14 +865,24 @@ def media_synthesizer_node(state: Dict) -> Dict:
         if fut_aud:
             audio_paths = fut_aud.result()
 
-    # 缺图占位补全：image_paths 中的 None 项用前一张成功的图填充，避免视频黑屏
+    # 缺图重试补全：对失败的图单独重试一轮（可能是临时网络/DNS 抖动）
     img_dir = os.path.join(ep_dir, "images")
+    missing_idx = [i for i, p in enumerate(image_paths) if not p or not (p and os.path.exists(p))]
+    if missing_idx and prompts:
+        print("    [补图] %d 张图缺失，单独重试" % len(missing_idx))
+        retry_prompts = [(i, prompts[i]) for i in missing_idx if i < len(prompts)]
+        retry_results = _retry_generate_images(episode, retry_prompts, ep_dir)
+        for i, path in retry_results.items():
+            if path:
+                image_paths[i] = path
+                print("    [补图] 第%d张重试成功" % (i + 1))
+
+    # 仍然缺失的图，用前一张成功的图占位（避免纯黑屏）
     last_ok = None
     for i, p in enumerate(image_paths):
         if p and os.path.exists(p):
             last_ok = p
         elif last_ok:
-            # 复制前一张成功图作为占位
             import shutil as _sh
             placeholder = os.path.join(img_dir, "%03d.png" % i)
             try:
@@ -823,7 +891,6 @@ def media_synthesizer_node(state: Dict) -> Dict:
                 print("    [补图] 第%d张缺失，用前一张占位" % (i + 1))
             except Exception:
                 pass
-    # 仍然为 None 的项统计
     still_missing = sum(1 for p in image_paths if not p)
     if still_missing:
         print("    [补图] 仍有 %d 张图无法占位（首图就失败）" % still_missing)
@@ -837,8 +904,43 @@ def media_synthesizer_node(state: Dict) -> Dict:
         print("[合成] %s 完成: %s (%.1f MB)" % (eid, video_path, sz_mb))
         # 黑屏检测：扫描视频找黑屏帧，统计黑屏占比
         black_pct = _detect_black_frames(video_path)
-        if black_pct > 0.5:
-            print("    [黑屏] 警告：%.1f%% 帧为黑/暗屏，建议核查缺失图片" % black_pct)
+        if black_pct > 5.0:
+            # 黑屏超 5%：找出缺失图，重试生图后重新合成
+            print("    [黑屏] %.1f%% 帧为黑/暗屏，自动重试缺图 + 重合成" % black_pct)
+            still_missing_idx = [i for i, p in enumerate(image_paths)
+                                 if not p or (p and not os.path.exists(p))]
+            # 也找出用占位图（灰色 0x404050）的项重试
+            placeholder_idxs = []
+            for i, p in enumerate(image_paths):
+                if p and os.path.exists(p):
+                    try:
+                        from PIL import Image
+                        import numpy as np
+                        arr = np.array(Image.open(p).convert("RGB"))
+                        # 纯灰占位图：所有像素接近 (64,64,80)
+                        if arr.std() < 5 and abs(arr.mean() - 70) < 20:
+                            placeholder_idxs.append(i)
+                    except Exception:
+                        pass
+            retry_idxs = list(set(still_missing_idx + placeholder_idxs))
+            if retry_idxs and prompts:
+                print("    [黑屏修复] 重试 %d 张图" % len(retry_idxs))
+                retry_items = [(i, prompts[i]) for i in retry_idxs if i < len(prompts)]
+                retry_results = _retry_generate_images(episode, retry_items, ep_dir)
+                replaced = 0
+                for i, path in retry_results.items():
+                    if path and os.path.exists(path):
+                        image_paths[i] = path
+                        replaced += 1
+                if replaced > 0:
+                    print("    [黑屏修复] 重试补回 %d 张，重新合成视频" % replaced)
+                    video_path = compose_video(image_paths, audio_paths, tts_meta, ep_dir, eid,
+                                               image_prompts=prompts)
+                    if video_path:
+                        black_pct2 = _detect_black_frames(video_path)
+                        sz_mb = os.path.getsize(video_path) / (1024 * 1024)
+                        print("[合成] %s 重合成完成: %s (%.1f MB) 黑屏 %.1f%%→%.1f%%"
+                              % (eid, video_path, sz_mb, black_pct, black_pct2))
         elif black_pct > 0:
             print("    [黑屏] 检测到 %.1f%% 暗帧（可接受范围）" % black_pct)
     else:

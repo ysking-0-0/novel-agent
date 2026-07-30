@@ -47,12 +47,17 @@ class RunConfig:
 @dataclass
 class StorageConfig:
     """存储路径与介质配置。"""
-    # 成品输出目录
-    output_dir: str = os.getenv("OUTPUT_DIR", "./output")
-    # 断点快照 Sqlite 路径
-    sqlite_path: str = os.getenv("SQLITE_PATH", "./checkpoints/checkpoint.sqlite")
-    # 全局记忆库目录（人物/事件/伏笔 JSON + FAISS 索引）
-    memory_dir: str = os.getenv("MEMORY_DIR", "./memory")
+    # 项目根目录（config.py 所在目录），所有路径基于此，不依赖运行时 cwd
+    _PROJECT_ROOT: str = os.path.dirname(os.path.abspath(__file__))
+    # 成品输出目录（绝对路径，不存在自动创建）
+    output_dir: str = os.getenv("OUTPUT_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "output"))
+    # 断点快照 Sqlite 路径（绝对路径）
+    sqlite_path: str = os.getenv("SQLITE_PATH",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "checkpoint.sqlite"))
+    # 全局记忆库目录（绝对路径）
+    memory_dir: str = os.getenv("MEMORY_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory"))
     # 是否启用向量检索（FAISS）
     enable_vector_retrieval: bool = (
         os.getenv("ENABLE_VECTOR_RETRIEVAL", "true").lower() == "true"
@@ -82,6 +87,8 @@ class MediaConfig:
     video_resolution: str = os.getenv("VIDEO_RESOLUTION", "1920x1080")
     # 视频帧率
     video_fps: int = int(os.getenv("VIDEO_FPS", "30"))
+    # 生图风格：anime=动漫 / realistic=写实（注入 material_generator prompt 的 {{ART_STYLE}}）
+    art_style: str = os.getenv("ART_STYLE", "anime")
     # 单幅图片展示目标时长（秒），material_generator 据此估算图片数量
     # 一两句话同一场景描述为一幅，约10秒换一幅
     image_duration_target: float = float(os.getenv("IMAGE_DURATION_TARGET", "10.0"))
@@ -165,7 +172,8 @@ def set_config(config_file: Optional[str] = None) -> Config:
                     setattr(cfg.run, k, v)
         if "storage" in data:
             for k, v in data["storage"].items():
-                if hasattr(cfg.storage, k):
+                # 空值跳过（保留 dataclass 默认的绝对路径），仅非空才覆盖
+                if v and hasattr(cfg.storage, k):
                     setattr(cfg.storage, k, v)
         if "media" in data:
             for k, v in data["media"].items():
@@ -176,5 +184,10 @@ def set_config(config_file: Optional[str] = None) -> Config:
         raise RuntimeError(
             "未检测到 MINIMAX_API_KEY，请设置环境变量或在配置文件 model.api_key 中填写。"
         )
+    # 自动创建存储目录（不存在则建），保证下载即用
+    for d in (cfg.storage.output_dir, cfg.storage.memory_dir,
+              os.path.dirname(cfg.storage.sqlite_path)):
+        if d:
+            os.makedirs(d, exist_ok=True)
     _global_config = cfg
     return cfg
