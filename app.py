@@ -347,12 +347,33 @@ def reset_prompt(name):
 
 # ────────────── 构建 Gradio 界面 ──────────────
 def build_ui():
+    # ①②两列等高靠 gr.Row(equal_height=True)；干预 flex-grow：
+    #   - col_progress 里的按钮/启动反馈框 flex-grow:0（不被拉伸）
+    #   - 含 log_box 的 form 独自 flex-grow:1 吃多余空间
+    #   - 日志 textarea 固定高度 + 内部滚动 = 滑动窗口
+    css = """
+        /* ② 标题块只占自然高度，不被撑高，让「运行状态」对齐「上传小说」*/
+        #col-progress > .form { flex-grow: 0 !important; }
+        #col-progress > .block { flex-grow: 0 !important; flex-shrink: 0 !important; }
+        /* ② 含 log-box 的 form 吃掉多余空间 */
+        #col-progress > .form:has(#log-box) { flex-grow: 1 !important; }
+        /* ② 刷新按钮、启动反馈框不被拉伸 */
+        #col-progress > button { flex-grow: 0 !important; flex-shrink: 0 !important; }
+        /* ② 日志 textarea 固定高度 + 内部滚动 */
+        #log-box textarea { resize: none; height: 520px !important; max-height: 520px !important; overflow-y: auto; }
+        /* 下方文案区 */
+        #ep-script textarea { resize: none; }
+        /* 下方 ep_prompts 与 ep_script 等高：给最小高度 */
+        #ep-prompts { min-height: 460px; }
+        #ep-prompts .json { min-height: 400px; }
+    """
+    align_js = "() => {}"
     with gr.Blocks(title="小说剧集生产控制台") as app:
         gr.Markdown("# 📖 长篇小说多媒体剧集生产控制台")
 
         with gr.Tab("生产控制"):
-            with gr.Row():
-                with gr.Column(scale=1):
+            with gr.Row(equal_height=True):
+                with gr.Column(scale=1, elem_id="col-task"):
                     gr.Markdown("### ① 任务配置")
                     novel_input = gr.File(label="上传小说 TXT（支持大文件，≤500MB）",
                                           file_types=[".txt"], type="filepath")
@@ -380,19 +401,20 @@ def build_ui():
                     resume_btn = gr.Button("♻️ 从断点续跑", variant="secondary")
                     stop_btn = gr.Button("⏹️ 停止生成", variant="stop")
 
-                with gr.Column(scale=1):
+                with gr.Column(scale=1, elem_id="col-progress"):
                     gr.Markdown("### ② 实时进度")
                     status_box = gr.Textbox(label="运行状态", value="⚪ 空闲",
                                             interactive=False)
                     log_box = gr.Textbox(
                         label="日志流", lines=25, max_lines=50,
-                        interactive=False, autoscroll=True,
+                        interactive=False, autoscroll=True, elem_id="log-box",
                     )
-                    start_feedback = gr.Textbox(label="启动反馈")
-                    # 周期刷新状态和日志（每 2 秒）
+                    refresh_btn = gr.Button("🔄 刷新日志")
+                    refresh_btn.click(fn=refresh_log, outputs=log_box)
                     timer = gr.Timer(value=2)
                     timer.tick(fn=refresh_log, outputs=log_box)
                     timer.tick(fn=refresh_status_simple, outputs=status_box)
+                    start_feedback = gr.Textbox(label="启动反馈", interactive=False)
                     start_btn.click(
                         fn=start_production,
                         inputs=[novel_input, target_input, art_style_dd, orient_dd,
@@ -408,8 +430,6 @@ def build_ui():
                         outputs=[status_box, start_feedback],
                     )
                     stop_btn.click(fn=stop_production, outputs=status_box)
-                    refresh_btn = gr.Button("🔄 刷新日志")
-                    refresh_btn.click(fn=refresh_log, outputs=log_box)
 
             with gr.Row():
                 gr.Markdown("### ③ 成品浏览")
@@ -422,11 +442,11 @@ def build_ui():
                     refresh_ep_btn = gr.Button("🔄 刷新集列表")
                 with gr.Column(scale=3):
                     ep_video = gr.Video(label="视频预览", height=520)
-            with gr.Row():
+            with gr.Row(equal_height=True, elem_id="row-output"):
                 with gr.Column(scale=1):
-                    ep_script = gr.Textbox(label="讲解文案", lines=18, interactive=False)
+                    ep_script = gr.Textbox(label="讲解文案", lines=20, interactive=False, elem_id="ep-script")
                 with gr.Column(scale=1):
-                    ep_prompts = gr.JSON(label="生图 Prompt 列表")
+                    ep_prompts = gr.JSON(label="生图 Prompt 列表", elem_id="ep-prompts")
 
                 refresh_ep_btn.click(
                     fn=refresh_episode_list,
@@ -461,7 +481,7 @@ def build_ui():
             # 进入标签页自动加载第一个
             prompt_selector.change(fn=load_prompt_content, inputs=prompt_selector, outputs=prompt_editor)
 
-    return app
+    return app, css, align_js
 
 
 def main():
@@ -474,9 +494,9 @@ def main():
     if os.path.exists(args.config):
         set_config(args.config)
 
-    app = build_ui()
+    app, css, js = build_ui()
     app.launch(server_port=args.port, share=args.share, inbrowser=False,
-               max_file_size="500mb")  # 允许上传至 500MB
+               max_file_size="500mb", css=css, js=js)
 
 
 if __name__ == "__main__":
