@@ -614,32 +614,112 @@ def _format_srt_time(seconds: float) -> str:
 
 
 def generate_srt(tts_meta: List[Dict], audio_paths: List[Optional[str]],
-                 ep_dir: str) -> Optional[str]:
-    """从 tts_meta 文本和音频时长生成 SRT 字幕文件。"""
-    srt_path = os.path.join(ep_dir, "subtitles.srt")
-    entries = []
-    t_cursor = 0.0  # 全局时间轴游标
+                 ep_dir: str, resolution: str = "1920x1080",
+                 sub_input_offset: int = 1) -> Optional[str]:
+    """用 PIL 生成每段字幕的透明 PNG，返回 overlay 滤镜链字符串。
+
+    libass (ffmpeg subtitles 滤镜) 在此环境下无法渲染 CJK 字符
+    （HarfBuzz shaping 缺陷），改为 PIL 渲染字幕图片 + ffmpeg overlay 叠加。
+    返回 overlay 滤镜链，由 compose_video 拼入 filter_complex。
+
+    sub_input_offset: 字幕 PNG 在 ffmpeg 输入流中的起始序号。
+        无 BGM 时输入布局 0=concat视频, 1..N=字幕PNG → offset=1；
+        有 BGM 时输入布局 0=concat视频, 1=bgm, 2..N=字幕PNG → offset=2。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    import textwrap
+    import re
+
+    W, H = resolution.split("x")
+    W, H = int(W), int(H)
+    font_size = 48
+    margin_bottom = 40
+    max_chars = 24  # 每行最大字符数
+
+    # 字体
+    font_file = _detect_cjk_font() or os.path.join("assets", "fonts", "simhei.ttf")
+    if not os.path.exists(font_file):
+        font_file = None
+    font = None
+    if font_file and os.path.exists(font_file):
+        try:
+            font = ImageFont.truetype(font_file, font_size)
+        except Exception:
+            font = None
+    if font is None:
+        font = ImageFont.load_default()
+
+    sub_dir = os.path.join(ep_dir, "_subs")
+    os.makedirs(sub_dir, exist_ok=True)
+
+    # 句级拆分：按 。！？；；拆句（保留分隔符），让字幕逐句跟随音频
+    # —— 无词级时间戳，按字符数比例分配各句时长（近似但足够）。
+    t_cursor = 0.0
+    overlays = []  # [(start, end, png_path, y_offset)]
+    global_idx = 0  # 全局 PNG 序号
     for i, m in enumerate(tts_meta):
         text = m.get("text", "").strip()
         if not text:
             continue
-        # 获取该段音频时长
         if i < len(audio_paths) and audio_paths[i] and os.path.exists(audio_paths[i]):
             dur = _audio_duration(audio_paths[i])
         else:
             dur = 3.0
-        start = t_cursor
-        end = t_cursor + dur
-        # 文本分行：每约 20 字符断行（避免太宽）
-        lines = []
-        for j in range(0, len(text), 20):
-            lines.append(text[j:j+20])
-        srt_text = "\n".join(lines)
-        entries.append(f"{len(entries)+1}\n{_format_srt_time(start)} --> {_format_srt_time(end)}\n{srt_text}")
-        t_cursor = end
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(entries))
-    return srt_path
+        seg_start = t_cursor
+        # 拆句：保留分隔符
+        sentences = re.split(r"(?<=[。！？；])", text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        # 极长无标点段兜底：按 max_chars 硬切
+        if len(sentences) == 1 and len(sentences[0]) > max_chars * 2:
+            sentences = textwrap.wrap(sentences[0], width=max_chars)
+        total_chars = sum(len(s) for s in sentences) or 1
+        s_cursor = seg_start
+        for si, sent in enumerate(sentences):
+            # 末句吃满段尾，避免浮点误差导致缺口
+            if si == len(sentences) - 1:
+                s_end = seg_start + dur
+            else:
+                s_dur = dur * (len(sent) / total_chars)
+                s_end = s_cursor + s_dur
+            s_start = s_cursor
+            # 折行渲染：如果换行后末行只剩几个字，合并回上一行避免孤行
+            lines = textwrap.wrap(sent, width=max_chars) if len(sent) > max_chars else [sent]
+            if len(lines) >= 2 and len(lines[-1]) <= 5:
+                lines = lines[:-2] + [lines[-2] + lines[-1]]
+            line_h = font_size + 8
+            total_h = len(lines) * line_h + 20
+            img = Image.new("RGBA", (W, total_h), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            for li, line in enumerate(lines):
+                bbox = d.textbbox((0, 0), line, font=font)
+                tw = bbox[2] - bbox[0]
+                x = (W - tw) // 2
+                y = li * line_h + 10
+                for dx, dy in [(-2,0),(2,0),(0,-2),(0,2),(-2,-2),(2,2),(-2,2),(2,-2)]:
+                    d.text((x+dx, y+dy), line, fill=(0,0,0,255), font=font)
+                d.text((x, y), line, fill=(255,255,255,255), font=font)
+            png_path = os.path.join(sub_dir, f"sub_{global_idx:03d}.png")
+            img.save(png_path)
+            y_off = H - total_h - margin_bottom
+            overlays.append((s_start, s_end, png_path, y_off))
+            s_cursor = s_end
+            global_idx += 1
+        t_cursor = seg_start + dur
+
+    # 构建 overlay 滤镜链：
+    # [0:v][1:v]overlay=0:y0:enable=between(t,s,e)[v1];
+    # [v1][2:v]overlay=0:y1:enable=between(t,s,e)[v2]; ...
+    parts = []
+    prev_label = "0:v"
+    for idx, (s, e, png, y) in enumerate(overlays):
+        # ffmpeg overlay 输入需要作为额外 -i 参数，这里只返回滤镜链
+        # 输入序号：视频=0，每个字幕 PNG 从 sub_input_offset 开始递增
+        inp = idx + sub_input_offset
+        out_label = f"[vsub{idx}]" if idx < len(overlays)-1 else "[vsub]"
+        parts.append(f"[{prev_label}][{inp}:v]overlay=0:{y}:enable='between(t,{s:.2f},{e:.2f})'{out_label}")
+        prev_label = f"vsub{idx}"
+    # 返回 (滤镜链, 字幕PNG列表)
+    return ";".join(parts), [o[2] for o in overlays]
 
 
 def _make_clip(image_path: Optional[str], audio_path: Optional[str],
@@ -855,51 +935,37 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
     cfg = get_config()
     bgm = cfg.media.bgm_path
     tts_gain = getattr(cfg.media, "tts_volume", 1.0)
-    # 字幕：若启用则生成 SRT 并在最终输出时烧录到视频
+    # 字幕：用 PIL 渲染 PNG + ffmpeg overlay（libass 无法渲染 CJK）
     enable_subs = getattr(cfg.media, "enable_subtitles", False)
-    srt_path = None
-    if enable_subs and tts_meta:
-        srt_path = generate_srt(tts_meta, audio_paths, ep_dir)
-        print("    [字幕] 生成 %s" % srt_path)
-    # 构建 drawtext/subtitles 滤镜
     sub_filter = ""
-    if srt_path and os.path.exists(srt_path):
-        # 转义路径中的冒号和反斜杠（Windows/WSL 路径需要）
-        esc_path = srt_path.replace("\\", "\\\\").replace(":", "\\:")
-        font_size = getattr(cfg.media, "subtitle_font_size", 42)
-        font_file = getattr(cfg.media, "subtitle_font", "")
-        # 自动探测系统 CJK 字体（WSL/Windows/Linux）
-        if not font_file or not os.path.exists(font_file):
-            font_file = _detect_cjk_font()
-        # 构建 subtitles 滤镜
-        # force_style 控制：白字黑描边、底部居中、上边距30px
-        style = ("FontSize=%d,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-                 "BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=30" % font_size)
-        # 把字体文件所在目录加入 fontsdir，让 libass 能找到 CJK 字体
-        fontdir_opt = ""
-        if font_file and os.path.exists(font_file):
-            fd = os.path.dirname(os.path.abspath(font_file))
-            esc_fd = fd.replace("\\", "\\\\").replace(":", "\\:")
-            fontdir_opt = ":fontsdir='%s'" % esc_fd
-        sub_filter = "subtitles='%s':force_style='%s'%s" % (esc_path, style, fontdir_opt)
+    sub_pngs = []
+    if enable_subs and tts_meta:
+        # 输入布局：0=concat视频, 1=bgm, 2..N=字幕PNG → offset=2
+        result = generate_srt(tts_meta, audio_paths, ep_dir, cfg.media.video_resolution,
+                              sub_input_offset=2 if (bgm and os.path.exists(bgm)) else 1)
+        if result and result[0]:
+            sub_filter, sub_pngs = result
+            print("    [字幕] 生成 %d 张 PNG" % len(sub_pngs))
 
     amix_audio = (
         "[0:a]volume=%.2f[tts];[1:a]volume=%.2f[bg];[tts][bg]amix=inputs=2:duration=first:dropout_transition=0[a]"
         % (tts_gain, cfg.media.bgm_volume)
     )
     if bgm and os.path.exists(bgm):
-        # 有 BGM：filter_complex 同时做音频混音 + 视频字幕
+        # 有 BGM：filter_complex 同时做音频混音 + 视频字幕overlay
+        # 输入：0=concat_out(视频), 1=bgm, 2..N=字幕PNG
+        sub_inputs = [item for png in sub_pngs for item in ("-i", png)]
         if sub_filter:
-            fc = "%s;[0:v]%s[v]" % (amix_audio, sub_filter)
-            vmap = "[v]"
+            fc = "%s;%s" % (amix_audio, sub_filter)
+            vmap = "[vsub]"
         else:
             fc = amix_audio
             vmap = "0:v"
         try:
             subprocess.run(
                 [exe, "-y", "-i", concat_out,
-                 "-stream_loop", "-1", "-i", bgm,
-                 "-filter_complex", fc,
+                 "-stream_loop", "-1", "-i", bgm] + sub_inputs +
+                ["-filter_complex", fc,
                  "-map", vmap, "-map", "[a]",
                  "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0", "-c:a", "aac",
                  "-r", str(cfg.media.video_fps), "-shortest", out],
@@ -909,8 +975,8 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
                 print("    [视频] BGM+字幕 混入首次失败，重试")
                 subprocess.run(
                     [exe, "-y", "-i", concat_out,
-                     "-stream_loop", "-1", "-i", bgm,
-                     "-filter_complex", fc,
+                     "-stream_loop", "-1", "-i", bgm] + sub_inputs +
+                    ["-filter_complex", fc,
                      "-map", vmap, "-map", "[a]",
                      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0", "-c:a", "aac",
                      "-r", str(cfg.media.video_fps), "-shortest", out],
@@ -921,18 +987,20 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
             import shutil as _sh
             _sh.copy(concat_out, out)
     else:
-        # 无 BGM：仅烧录字幕
+        # 无 BGM：仅叠加字幕overlay
+        sub_inputs = [item for png in sub_pngs for item in ("-i", png)]
         if sub_filter:
             try:
                 subprocess.run(
-                    [exe, "-y", "-i", concat_out,
-                     "-vf", sub_filter,
+                    [exe, "-y", "-i", concat_out] + sub_inputs +
+                    ["-filter_complex", sub_filter,
+                     "-map", "[vsub]",
                      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0",
                      "-c:a", "aac", "-r", str(cfg.media.video_fps), out],
                     capture_output=True, timeout=600,
                 )
             except Exception as e:
-                print("    [视频] 字幕烧录失败: %s，用无字幕版本" % e)
+                print("    [视频] 字幕叠加失败: %s，用无字幕版本" % e)
                 import shutil as _sh
                 _sh.copy(concat_out, out)
         else:
