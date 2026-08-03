@@ -99,6 +99,34 @@ def _find_latest_thread_id(graph) -> str:
         return "novel_main_thread"
 
 
+def _next_resume_thread_id(graph) -> str:
+    """生成一个不与已有 thread 撞名的新 thread_id。
+
+    扫描 checkpoints 表里所有 novel_main_thread_resume_N，取最大序号 +1。
+    避免用 completed_episode_count 拼（可能和已有 thread 重名 → 复用已 END
+    的 thread 导致 LangGraph 空转中断）。
+    """
+    import sqlite3
+    import re
+    try:
+        db_path = get_config().storage.sqlite_path
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE 'novel_main_thread_resume_%'"
+        ).fetchall()
+        conn.close()
+        max_n = 0
+        for (tid,) in rows:
+            m = re.match(r"novel_main_thread_resume_(\d+)$", tid)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+        return "novel_main_thread_resume_%d" % (max_n + 1)
+    except Exception:
+        # 退化：用时间戳保证唯一
+        import time
+        return "novel_main_thread_resume_%d" % int(time.time())
+
+
 def _resume_state(graph, thread_id: str, target_override: int = None) -> Dict[str, Any] | None:
     """尝试从 SqliteSaver 读取断点状态。
 
@@ -177,8 +205,12 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
             is_finished = bool(snap) and snap[0].next == ()
             if is_finished:
                 print(f"[续跑] 旧断点已结束（已完成{done}集），追加 {target_increment} 集→新目标 {target_override}，从 offset={state.get('offset',0)} 续跑")
-                # 用新 thread_id 续跑，避免和旧 END 状态冲突
-                thread_id = "novel_main_thread_resume_%d" % done
+                # 用全新 thread_id 续跑，避免和已 END 的状态冲突。
+                # 关键：不能用 "resume_%d" % done 拼——done 可能和已有 thread 撞名
+                # （如已存在 resume_5 时再次续跑 done=5 会复用已 END 的 resume_5，
+                #  把新 input 塞进已结束的 thread → LangGraph 空转/异常中断，只跑1集就停）。
+                # 改为扫描所有 novel_main_thread_resume_N 取最大序号 +1，保证唯一。
+                thread_id = _next_resume_thread_id(graph)
                 config = {"configurable": {"thread_id": thread_id}}
                 # state 作为全新输入传入（不走 None 恢复）
                 input_state = state
