@@ -332,6 +332,7 @@ def _run_single_ep_task(ep_id, fn, label):
     """后台线程跑 resynthesize_video / regenerate_episode_media，日志回流到 _RUN.log_lines。
 
     复用主生产的日志通道，Gradio Timer 会自动刷新显示。
+    用 stdout tee 让 fn 内部所有 print（含 media_synthesizer_node 深层）都进日志窗。
     """
     if not ep_id:
         return "⚠️ 请先选择剧集"
@@ -343,7 +344,27 @@ def _run_single_ep_task(ep_id, fn, label):
 
     _RUN.log_lines.append(f"[{label}] 目标: {ep_id}")
 
+    class _Tee:
+        """同时写原 stdout 和 log_lines 的 stdout 替身。"""
+        def __init__(self, real):
+            self.real = real
+            self.encoding = getattr(real, "encoding", "utf-8")
+            self.errors = getattr(real, "errors", "replace")
+        def write(self, s):
+            if s.strip():
+                _RUN.log_lines.append(s.rstrip())
+            try: self.real.write(s)
+            except Exception: pass
+        def flush(self):
+            try: self.real.flush()
+            except Exception: pass
+        def reconfigure(self, **kw): pass
+
     def _worker():
+        import contextlib as _ctx
+        old = sys.stdout
+        tee = _Tee(old)
+        sys.stdout = tee
         try:
             fn(ep_id)
         except Exception as e:
@@ -351,6 +372,7 @@ def _run_single_ep_task(ep_id, fn, label):
             _RUN.log_lines.append(f"[{label}] 异常: {e}")
             _RUN.log_lines.append(_tb.format_exc()[-400:])
         finally:
+            sys.stdout = old
             _RUN.log_lines.append(f"[{label}] 结束")
             with _RUN.lock:
                 _RUN.is_running = False

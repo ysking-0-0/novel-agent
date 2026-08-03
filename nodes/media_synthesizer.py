@@ -28,6 +28,24 @@ import requests
 from config import get_config
 
 
+# ────────────── 日志回流钩子（供 app.py 注入，让 print 进 Gradio 日志窗） ──────────────
+_log_sink = None  # callable(str) or None
+
+def set_log_sink(sink):
+    """注入日志回调。sink(str) 被每个 print 行调用。传 None 清除。"""
+    global _log_sink
+    _log_sink = sink
+
+def _emit(line: str):
+    """print 的统一出口：同时输出 stdout 和日志回调。"""
+    print(line)
+    if _log_sink:
+        try:
+            _log_sink(line)
+        except Exception:
+            pass
+
+
 # ────────────── HTTP 调用（线程内复用 session） ──────────────
 _session_local = threading.local()
 
@@ -1037,16 +1055,19 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
 
 
 # ────────────── LangGraph 节点入口 ──────────────
-def media_synthesizer_node(state: Dict) -> Dict:
+def media_synthesizer_node(state: Dict, ep_id_override: str = None) -> Dict:
     """多媒体合成节点入口。
     从已归档的 output/ep_xxx/ 读取 episode_info/image_prompts/tts_meta，
     不依赖 state 中的临时字段（persistence 已清理）。
+
+    ep_id_override: 重跑指定集时传入真实 eid（如 'ep_004'），绕过 count 推算。
+        主循环不传（走 state['completed_episode_count'] 推算）。
     """
     cfg = get_config()
     if not cfg.media.enable_synthesis:
         return {}
 
-    eid = "ep_%03d" % state.get("completed_episode_count", 0)
+    eid = ep_id_override or "ep_%03d" % state.get("completed_episode_count", 0)
     ep_dir = os.path.join(cfg.storage.output_dir, eid)
     if not os.path.isdir(ep_dir):
         return {}
@@ -1300,9 +1321,8 @@ def regenerate_episode_media(ep_id: str) -> Optional[str]:
     print("[重跑] %s：已清旧媒体，重生图 %d 张 + TTS %d 段 + 视频"
           % (ep_id, len(prompts), len(tts_meta)))
 
-    # 复用 media_synthesizer_node 的生图+TTS+黑屏修复主流程（构造伪 state）
-    fake_state = {"completed_episode_count": int(ep_id.replace("ep_", "")) - 1}
-    result = media_synthesizer_node(fake_state)
+    # 复用 media_synthesizer_node 的生图+TTS+黑屏修复主流程（显式传 eid，绕过 count 推算）
+    result = media_synthesizer_node({}, ep_id_override=ep_id)
     video_path = result.get("video_path") if result else None
     if video_path:
         print("[重跑] %s 完成: %s" % (ep_id, video_path))
