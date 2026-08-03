@@ -33,6 +33,7 @@ import gradio as gr
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import set_config, get_config
 from prompts import load_prompt, save_prompt, list_prompts, ART_STYLES
+from nodes.media_synthesizer import resynthesize_video, regenerate_episode_media
 
 
 # ────────────── 文件日志（调试用，/tmp/app_debug.log） ──────────────
@@ -326,6 +327,48 @@ def refresh_episode_list():
     return gr.Dropdown(choices=choices, value=first_val), *load_episode_all(first_val)
 
 
+# ────────────── 单集重生 / 补字幕 ──────────────
+def _run_single_ep_task(ep_id, fn, label):
+    """后台线程跑 resynthesize_video / regenerate_episode_media，日志回流到 _RUN.log_lines。
+
+    复用主生产的日志通道，Gradio Timer 会自动刷新显示。
+    """
+    if not ep_id:
+        return "⚠️ 请先选择剧集"
+    with _RUN.lock:
+        if _RUN.is_running:
+            return "⚠️ 有任务在运行，请先停止"
+        _RUN.reset()
+        _RUN.is_running = True
+
+    _RUN.log_lines.append(f"[{label}] 目标: {ep_id}")
+
+    def _worker():
+        try:
+            fn(ep_id)
+        except Exception as e:
+            import traceback as _tb
+            _RUN.log_lines.append(f"[{label}] 异常: {e}")
+            _RUN.log_lines.append(_tb.format_exc()[-400:])
+        finally:
+            _RUN.log_lines.append(f"[{label}] 结束")
+            with _RUN.lock:
+                _RUN.is_running = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return f"✅ {label} 已启动: {ep_id}"
+
+
+def resynth_video(ep_id):
+    """仅重合成视频（补字幕 / 换 BGM），秒级完成，不调任何 API。"""
+    return _run_single_ep_task(ep_id, resynthesize_video, "补字幕/重合成")
+
+
+def rerun_episode(ep_id):
+    """重跑本集全部媒体（生图+TTS+视频），保留剧本/prompt 不变。"""
+    return _run_single_ep_task(ep_id, regenerate_episode_media, "重跑本集")
+
+
 # ────────────── 提示词管理 ──────────────
 def load_prompt_content(name):
     """加载指定 agent 的 prompt 到编辑框。"""
@@ -449,6 +492,12 @@ def build_ui():
                         label="选择剧集", interactive=True,
                     )
                     refresh_ep_btn = gr.Button("🔄 刷新集列表")
+                    resynth_btn = gr.Button("📝 仅重合成视频（补字幕/换BGM）",
+                                            variant="secondary", elem_id="btn-resynth")
+                    rerun_btn = gr.Button("♻️ 重跑本集（生图+TTS+视频）",
+                                          variant="stop", elem_id="btn-rerun")
+                    ep_task_status = gr.Textbox(label="单集任务状态", interactive=False,
+                                                value="", elem_id="ep-task-status")
                 with gr.Column(scale=3):
                     ep_video = gr.Video(label="视频预览", height=520)
             with gr.Row(equal_height=True, elem_id="row-output"):
@@ -465,6 +514,12 @@ def build_ui():
                     fn=load_episode_all,
                     inputs=ep_choices,
                     outputs=[ep_video, ep_script, ep_prompts],
+                )
+                resynth_btn.click(
+                    fn=resynth_video, inputs=ep_choices, outputs=ep_task_status,
+                )
+                rerun_btn.click(
+                    fn=rerun_episode, inputs=ep_choices, outputs=ep_task_status,
                 )
 
         with gr.Tab("提示词管理"):

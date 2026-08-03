@@ -674,12 +674,15 @@ def generate_srt(tts_meta: List[Dict], audio_paths: List[Optional[str]],
     global_idx = 0  # 全局 PNG 序号
     for i, m in enumerate(tts_meta):
         text = m.get("text", "").strip()
-        if not text:
-            continue
+        # 关键：即使文本为空也必须累加 t_cursor，否则字幕时间轴会落后于画面。
+        # 视频里该段音频仍占 seg_dur 秒，字幕若跳过不累加，后续字幕全部前移 → 错位。
         if i < len(audio_paths) and audio_paths[i] and os.path.exists(audio_paths[i]):
             dur = _audio_duration(audio_paths[i])
         else:
             dur = 3.0
+        if not text:
+            t_cursor += dur   # 占位但仍推进时间轴
+            continue
         seg_start = t_cursor
         # 拆句：保留分隔符
         sentences = re.split(r"(?<=[。！？；])", text)
@@ -1207,3 +1210,102 @@ def _detect_black_frames(video_path: str, threshold: float = 0.07) -> float:
     except Exception as e:
         print("    [黑屏] 检测失败: %s" % e)
         return 0.0
+
+
+# ────────────── 单集重生 / 补字幕（可独立调用，不依赖 LangGraph） ──────────────
+def _load_ep_meta(ep_dir: str):
+    """读取已归档集的 episode_info / image_prompts / tts_meta。"""
+    with open(os.path.join(ep_dir, "episode_info.json"), "r", encoding="utf-8") as f:
+        episode = json.load(f)
+    with open(os.path.join(ep_dir, "image_prompts.json"), "r", encoding="utf-8") as f:
+        prompts = json.load(f)
+    with open(os.path.join(ep_dir, "tts_meta.json"), "r", encoding="utf-8") as f:
+        tts_meta = json.load(f)
+    return episode, prompts, tts_meta
+
+
+def _list_audio_paths(ep_dir: str, n: int) -> list:
+    return [os.path.join(ep_dir, "audio", "%03d.mp3" % i) for i in range(n)]
+
+
+def _list_image_paths(ep_dir: str, n: int) -> list:
+    return [os.path.join(ep_dir, "images", "%03d.png" % i) for i in range(n)]
+
+
+def resynthesize_video(ep_id: str) -> Optional[str]:
+    """仅重合成视频（复用已有 images/audio），用于补字幕 / 换 BGM / 改分辨率。
+
+    场景：生成时忘记开字幕 → 开 enable_subtitles 后调此函数秒级重出视频。
+    不调任何 LLM/生图/TTS 接口，纯本地 ffmpeg 拼接。
+    """
+    cfg = get_config()
+    out_dir = cfg.storage.output_dir
+    ep_dir = os.path.join(out_dir, ep_id)
+    if not os.path.isdir(ep_dir):
+        print("[重合成] %s 不存在" % ep_id)
+        return None
+    try:
+        episode, prompts, tts_meta = _load_ep_meta(ep_dir)
+    except Exception as e:
+        print("[重合成] %s 读取归档失败: %s" % (ep_id, e))
+        return None
+    image_paths = [p if os.path.exists(p) else None
+                   for p in _list_image_paths(ep_dir, len(prompts))]
+    audio_paths = [p if os.path.exists(p) else None
+                   for p in _list_audio_paths(ep_dir, len(tts_meta))]
+    # 删旧 mp4 + 旧字幕 PNG，确保干净重出
+    old_mp4 = os.path.join(ep_dir, "%s.mp4" % ep_id)
+    if os.path.exists(old_mp4):
+        os.remove(old_mp4)
+    sub_dir = os.path.join(ep_dir, "_subs")
+    if os.path.isdir(sub_dir):
+        shutil.rmtree(sub_dir, ignore_errors=True)
+    print("[重合成] %s：复用 %d 图 / %d 音频，重拼视频（字幕=%s）"
+          % (ep_id, len(image_paths), len(audio_paths), cfg.media.enable_subtitles))
+    video_path = compose_video(image_paths, audio_paths, tts_meta, ep_dir, ep_id,
+                               image_prompts=prompts)
+    if video_path:
+        print("[重合成] %s 完成: %s" % (ep_id, video_path))
+    else:
+        print("[重合成] %s 失败" % ep_id)
+    return video_path
+
+
+def regenerate_episode_media(ep_id: str) -> Optional[str]:
+    """重跑本集全部媒体（生图+TTS+视频），保留 LLM 产出的剧本/prompt。
+
+    场景：对某集画面/音色不满意 → 删 images/audio/mp4/_subs，重调生图+TTS 接口，
+    再拼视频。不重跑 LLM（剧本/文案/prompt 审过就不动），省 token、结果可控。
+    """
+    cfg = get_config()
+    out_dir = cfg.storage.output_dir
+    ep_dir = os.path.join(out_dir, ep_id)
+    if not os.path.isdir(ep_dir):
+        print("[重跑] %s 不存在" % ep_id)
+        return None
+    try:
+        episode, prompts, tts_meta = _load_ep_meta(ep_dir)
+    except Exception as e:
+        print("[重跑] %s 读取归档失败: %s" % (ep_id, e))
+        return None
+
+    # 清旧媒体（保留 episode_info/image_prompts/tts_meta/script/original_snippet）
+    for sub in ("images", "audio", "_subs", "_tmp_clips"):
+        p = os.path.join(ep_dir, sub)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+    old_mp4 = os.path.join(ep_dir, "%s.mp4" % ep_id)
+    if os.path.exists(old_mp4):
+        os.remove(old_mp4)
+    print("[重跑] %s：已清旧媒体，重生图 %d 张 + TTS %d 段 + 视频"
+          % (ep_id, len(prompts), len(tts_meta)))
+
+    # 复用 media_synthesizer_node 的生图+TTS+黑屏修复主流程（构造伪 state）
+    fake_state = {"completed_episode_count": int(ep_id.replace("ep_", "")) - 1}
+    result = media_synthesizer_node(fake_state)
+    video_path = result.get("video_path") if result else None
+    if video_path:
+        print("[重跑] %s 完成: %s" % (ep_id, video_path))
+    else:
+        print("[重跑] %s 失败" % ep_id)
+    return video_path
