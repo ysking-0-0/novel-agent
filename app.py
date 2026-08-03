@@ -63,13 +63,16 @@ _RUN = _RunState()
 
 
 def _build_run_cmd(novel_path, target, art_style, orientation, tts_speed,
-                   bgm_volume, tts_volume, chunk_size, max_retries, resume=False) -> list:
-    """构造 main.py 运行命令。resume=True 加 --resume。"""
+                   bgm_volume, tts_volume, chunk_size, max_retries, resume=False,
+                   novel_queue=None) -> list:
+    """构造 main.py 运行命令。resume=True 加 --resume。novel_queue: 后续 txt 路径列表。"""
     cmd = [sys.executable, "main.py", "--config", "config.json"]
     if resume:
         cmd += ["--resume"]
     elif novel_path:
         cmd += ["--novel", novel_path]
+    if novel_queue:
+        cmd += ["--novel-queue"] + novel_queue
     if target and int(target) > 0:
         cmd += ["--target", str(int(target))]
     if chunk_size:
@@ -121,30 +124,39 @@ def start_production(novel_file, target, art_style, orientation,
             _RUN.is_running = True
 
         novel_path = ""
+        novel_queue = []   # 后续 txt 路径列表
         if resume:
             _RUN.log_lines.append("[续跑] 从上次断点恢复，不重新上传文件")
         elif novel_file is not None:
-            novel_path = os.path.join("data", "novel.txt")
             os.makedirs("data", exist_ok=True)
-            src = novel_file
-            _log_file("novel_file 原始类型=%s repr=%s", type(src).__name__, repr(src)[:200])
-            if hasattr(src, "path"):
-                src = src.path
-            elif hasattr(src, "name"):
-                src = src.name
-            elif isinstance(src, dict):
-                src = src.get("path") or src.get("name") or ""
-            _log_file("解析后 src=%s exists=%s", src, os.path.exists(src) if isinstance(src, str) else "N/A")
-            if isinstance(src, str) and os.path.exists(src):
-                shutil.copy(src, novel_path)
-                sz_mb = os.path.getsize(novel_path) / 1024 / 1024
-                _RUN.log_lines.append(f"[上传] 已保存到 {novel_path} ({sz_mb:.1f} MB)")
-                _log_file("上传成功 %s %.1fMB", novel_path, sz_mb)
-            else:
-                _RUN.log_lines.append(f"[上传警告] 无法定位路径，type={type(novel_file).__name__}")
+            # novel_file 可能是单文件(str)或多文件(list)——file_count="multiple" 返回 list
+            files = novel_file if isinstance(novel_file, (list, tuple)) else [novel_file]
+            _log_file("novel_file 数量=%d 类型=%s", len(files), type(novel_file).__name__)
+            saved_paths = []
+            for fi, f in enumerate(files):
+                src = f
+                if hasattr(src, "path"):
+                    src = src.path
+                elif hasattr(src, "name"):
+                    src = src.name
+                elif isinstance(src, dict):
+                    src = src.get("path") or src.get("name") or ""
+                if isinstance(src, str) and os.path.exists(src):
+                    dest = os.path.join("data", "novel_%d.txt" % fi) if fi else os.path.join("data", "novel.txt")
+                    shutil.copy(src, dest)
+                    sz_mb = os.path.getsize(dest) / 1024 / 1024
+                    saved_paths.append(dest)
+                    _RUN.log_lines.append(f"[上传] 第{fi+1}本 → {dest} ({sz_mb:.1f} MB)")
+                else:
+                    _RUN.log_lines.append(f"[上传警告] 第{fi+1}本无法定位路径 type={type(f).__name__}")
+            if not saved_paths:
                 with _RUN.lock:
                     _RUN.is_running = False
-                return f"❌ 无法定位上传文件（type={type(novel_file).__name__}, val={novel_file!r:.80}）", []
+                return "❌ 无法定位任何上传文件", []
+            novel_path = saved_paths[0]
+            novel_queue = saved_paths[1:]   # 后续本进队列
+            if novel_queue:
+                _RUN.log_lines.append(f"[多本] 共 {len(saved_paths)} 本，首本 {novel_path}，后续 {len(novel_queue)} 本排队")
         else:
             # 未上传新文件：尝试复用 data/novel.txt
             cached = os.path.join("data", "novel.txt")
@@ -166,7 +178,7 @@ def start_production(novel_file, target, art_style, orientation,
 
         cmd = _build_run_cmd(novel_path, target, art_style, orientation,
                              tts_speed, bgm_volume, tts_volume, chunk_size, max_retries,
-                             resume=resume)
+                             resume=resume, novel_queue=novel_queue)
         _RUN.log_lines.append(f"[启动] 命令: {' '.join(cmd)}")
         _RUN.log_lines.append(f"[参数] 风格={art_style} 方向={orientation} "
                               f"BGM={bgm_volume} TTS音量={tts_volume} 字幕={enable_subtitles} 续跑={resume}")
@@ -450,8 +462,9 @@ def build_ui():
             with gr.Row(equal_height=True):
                 with gr.Column(scale=1, elem_id="col-task"):
                     gr.Markdown("### ① 任务配置")
-                    novel_input = gr.File(label="上传小说 TXT（支持大文件，≤500MB）",
-                                          file_types=[".txt"], type="filepath")
+                    novel_input = gr.File(label="上传小说 TXT（可多选，超长篇拆多本时按顺序衔接）",
+                                          file_types=[".txt"], type="filepath",
+                                          file_count="multiple")
                     target_input = gr.Number(label="目标集数", value=4, precision=0,
                                               info="全新运行=总集数；续跑=追加几集（如已完成4集+填1→跑到第5集）")
                     art_style_dd = gr.Dropdown(

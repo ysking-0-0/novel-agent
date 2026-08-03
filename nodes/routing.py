@@ -89,7 +89,15 @@ def route_after_persistence(state: Dict) -> str:
 
 # ---------- 循环出口：text_chunker 读完后判断 ----------
 def route_after_chunking(state: Dict) -> str:
-    """文末 + 无 pending → 直接 END；否则进入剧情解析。"""
+    """文末 + 无 pending → 直接 END；否则进入剧情解析。
+
+    多 TXT 切换：text_chunker 返回 _file_just_switched=True 表示刚切到下一本，
+    此时 current_chunk 为空、loop_finished 为 False，应直接回 text_chunker
+    从新文件 offset=0 开始读，不走 plot_parser（空块无内容可解析）。
+    """
+    if state.get("_file_just_switched"):
+        # 清除信号后回 text_chunker 读新文件
+        return "text_chunker"
     if state.get("loop_finished"):
         pending = state.get("pending_scenes") or []
         if len(pending) == 0:

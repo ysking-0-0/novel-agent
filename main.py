@@ -32,11 +32,12 @@ from graph import build_graph
 from agents import get_memory_agent
 
 
-def _initial_state(novel_path: str, target: int = None) -> Dict[str, Any]:
-    """构造全新初始状态。"""
+def _initial_state(novel_path: str, target: int = None, novel_queue: list = None) -> Dict[str, Any]:
+    """构造全新初始状态。novel_queue: 后续待读的 txt 路径列表。"""
     return {
         # 分片控制
         "file_path": novel_path,
+        "file_queue": novel_queue or [],
         "offset": 0,
         "chunk_size": get_config().run.chunk_size,
         "current_chunk": "",
@@ -154,7 +155,8 @@ def _resume_state(graph, thread_id: str, target_override: int = None) -> Dict[st
         return None
 
 
-def run(novel_path: str, target: int = None, resume: bool = False, config_file: str = None):
+def run(novel_path: str, target: int = None, resume: bool = False, config_file: str = None,
+        novel_queue: list = None):
     """主运行入口。"""
     if config_file and os.path.exists(config_file):
         set_config(config_file)
@@ -221,12 +223,13 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
                 input_state = None
         else:
             print("[续跑] 未找到断点，全新启动")
-            state = _initial_state(novel_path, target)
+            state = _initial_state(novel_path, target, novel_queue)
             input_state = state
     else:
-        state = _initial_state(novel_path, target)
+        state = _initial_state(novel_path, target, novel_queue)
         input_state = state
-        print(f"[启动] 全新任务，目标集数: {target if target else '全本'}")
+        q_info = f"，后续 {len(novel_queue)} 本" if novel_queue else ""
+        print(f"[启动] 全新任务，目标集数: {target if target else '全本'}{q_info}")
 
     # 初始化记忆 Agent（首次运行建立空记忆库）
     mem = get_memory_agent()
@@ -302,6 +305,8 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
 def main():
     parser = argparse.ArgumentParser(description="长篇小说多媒体剧集生产多 Agent 系统")
     parser.add_argument("--novel", default=None, help="小说 TXT 文件路径（续跑可不提供）")
+    parser.add_argument("--novel-queue", nargs="*", default=None,
+                        help="后续待读的 TXT 路径列表（超长篇拆成多本时用，按顺序自动衔接）")
     parser.add_argument("--target", type=int, default=None, help="目标生成集数，不设为全本")
     parser.add_argument("--resume", action="store_true", help="从断点继续")
     parser.add_argument("--config", default=None, help="配置文件路径 (yaml/json)")
@@ -327,6 +332,7 @@ def main():
         target=args.target,
         resume=args.resume,
         config_file=args.config,
+        novel_queue=args.novel_queue,
     )
 
 

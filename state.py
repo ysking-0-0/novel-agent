@@ -11,6 +11,8 @@ class NovelState(TypedDict, total=False):
     # ───────── 分片控制 ─────────
     # 本地小说 TXT 文件路径，不存储全文本
     file_path: str
+    # 待读的后续 TXT 文件列表（超长篇拆成多本时用），当前本读完自动切换
+    file_queue: List[str]
     # 文件读取字节偏移游标，断点续跑核心标识
     offset: int
     # 单次读取基础字符上限，可配置
@@ -67,10 +69,12 @@ class NovelState(TypedDict, total=False):
 
 def initial_state(file_path: str,
                   chunk_size: int = 8000,
-                  target_episode_count: Optional[int] = None) -> NovelState:
-    """全新任务的初始状态。"""
+                  target_episode_count: Optional[int] = None,
+                  file_queue: List[str] = None) -> NovelState:
+    """全新任务的初始状态。file_queue: 后续待读的 txt 路径列表。"""
     return NovelState(
         file_path=file_path,
+        file_queue=file_queue or [],
         offset=0,
         chunk_size=chunk_size,
         current_chunk="",

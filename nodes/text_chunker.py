@@ -38,23 +38,47 @@ def _find_next_chapter_boundary(text: str) -> int:
 
 
 def text_chunker_node(state: Dict) -> Dict:
-    """读取下一段文本，对齐章节边界，更新 offset（按字节偏移，二进制读取避免字符截断）。"""
+    """读取下一段文本，对齐章节边界，更新 offset（按字节偏移，二进制读取避免字符截断）。
+
+    多 TXT 衔接：当前文件读完（loop_finished）且 file_queue 还有后续文件时，
+    自动切换到下一本（offset 归零、file_path 切换、loop_finished 重置为 False），
+    让主循环无感继续，避免用户手动换文件。
+    """
     file_path: str = state.get("file_path", "")
     offset: int = state.get("offset", 0)
     chunk_size: int = state.get("chunk_size", 8000)
+    file_queue = state.get("file_queue") or []
+
+    # 清除上一轮的文件切换信号（已处理过）
+    ret = {}
+    if state.get("_file_just_switched"):
+        ret["_file_just_switched"] = False
 
     if not file_path:
-        return {"current_chunk": "", "loop_finished": True}
+        return {**ret, "current_chunk": "", "loop_finished": True}
 
     try:
         with open(file_path, "rb") as f:
             f.seek(offset)
             raw_bytes = f.read(chunk_size + 2000)  # 多读一截用于对齐
     except FileNotFoundError:
-        return {"current_chunk": "", "loop_finished": True}
+        return {**ret, "current_chunk": "", "loop_finished": True}
 
     if not raw_bytes:
-        return {"current_chunk": "", "loop_finished": True}
+        # 当前文件读完，检查是否有后续文件
+        if file_queue:
+            next_file = file_queue[0]
+            print("[分片] 当前文件已读完，切换到下一本: %s" % next_file)
+            return {
+                **ret,
+                "current_chunk": "",          # 空块，让 route 走文末打包逻辑
+                "file_path": next_file,
+                "file_queue": file_queue[1:],
+                "offset": 0,
+                "loop_finished": False,      # 重置，下一本从头读
+                "_file_just_switched": True,  # 信号：让 route 知道这是切换不是真结束
+            }
+        return {**ret, "current_chunk": "", "loop_finished": True}
 
     raw = raw_bytes.decode("utf-8", errors="ignore")
 
@@ -68,6 +92,14 @@ def text_chunker_node(state: Dict) -> Dict:
         f.seek(0, 2)
         file_size = f.tell()
     finished = new_offset >= file_size
+
+    # 真正读完当前文件，但有后续文件 → 提前切换，不等下次进 text_chunker
+    if finished and file_queue:
+        # 本块正常返回（让 plot_parser 处理这最后一块文本），
+        # 但 loop_finished 设 False，file_path/queue 在下次 text_chunker 时切换。
+        # 这里只标记"还有后续"，真正切换发生在下次 raw_bytes 为空时。
+        print("[分片] 当前文件读到末尾，下次将切换到下一本: %s" % file_queue[0])
+        finished = False  # 不结束，让下次进来时走切换逻辑
 
     return {
         "current_chunk": chunk,

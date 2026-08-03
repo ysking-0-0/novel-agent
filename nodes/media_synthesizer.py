@@ -1202,6 +1202,13 @@ def media_synthesizer_node(state: Dict, ep_id_override: str = None) -> Dict:
     else:
         print("[合成] %s 视频未生成（图片/音频已落盘）" % eid)
 
+    # 集间间隔：让生图 API 的 RPM 限流配额恢复，避免下一集开头连续 429/1002 限流。
+    # 用户反馈"第一集快第二集慢"即源于此。间隔只在实际还有下一集时生效（由 target 控制）。
+    inter_episode_pause = int(getattr(cfg.media, "inter_episode_pause", 45))
+    if inter_episode_pause > 0 and video_path:
+        print("[间隔] 等待 %d 秒让生图 API 限流配额恢复再继续下一集..." % inter_episode_pause)
+        time.sleep(inter_episode_pause)
+
     return {"video_path": video_path}
 
 
