@@ -145,8 +145,9 @@ def start_production(novel_file, target, art_style, orientation,
                     dest = os.path.join("data", "novel_%d.txt" % fi) if fi else os.path.join("data", "novel.txt")
                     shutil.copy(src, dest)
                     sz_mb = os.path.getsize(dest) / 1024 / 1024
+                    orig_name = os.path.basename(src)
                     saved_paths.append(dest)
-                    _RUN.log_lines.append(f"[上传] 第{fi+1}本 → {dest} ({sz_mb:.1f} MB)")
+                    _RUN.log_lines.append(f"[上传] 第{fi+1}本 [{orig_name}] → {dest} ({sz_mb:.1f} MB)")
                 else:
                     _RUN.log_lines.append(f"[上传警告] 第{fi+1}本无法定位路径 type={type(f).__name__}")
             if not saved_paths:
@@ -155,8 +156,13 @@ def start_production(novel_file, target, art_style, orientation,
                 return "❌ 无法定位任何上传文件", []
             novel_path = saved_paths[0]
             novel_queue = saved_paths[1:]   # 后续本进队列
-            if novel_queue:
-                _RUN.log_lines.append(f"[多本] 共 {len(saved_paths)} 本，首本 {novel_path}，后续 {len(novel_queue)} 本排队")
+            # 读取顺序总览：1→2→3...
+            order_str = " → ".join(os.path.basename(p) for p in saved_paths)
+            _RUN.log_lines.append(
+                f"[多本] 共 {len(saved_paths)} 本，读取顺序: {order_str}"
+            ) if novel_queue else _RUN.log_lines.append(
+                f"[单本] 读取: {os.path.basename(novel_path)}"
+            )
         else:
             # 未上传新文件：尝试复用 data/novel.txt
             cached = os.path.join("data", "novel.txt")
@@ -462,10 +468,10 @@ def build_ui():
             with gr.Row(equal_height=True):
                 with gr.Column(scale=1, elem_id="col-task"):
                     gr.Markdown("### ① 任务配置")
-                    novel_input = gr.File(label="上传小说 TXT（可多选，超长篇拆多本时按顺序衔接）",
+                    novel_input = gr.File(label="小说文本（可多选，列表顺序=读取顺序，支持拖拽调整）",
                                           file_types=[".txt"], type="filepath",
-                                          file_count="multiple")
-                    target_input = gr.Number(label="目标集数", value=4, precision=0,
+                                          file_count="multiple", allow_reordering=True)
+                    target_input = gr.Number(label="目标集数", value=1, precision=0,
                                               info="全新运行=总集数；续跑=追加几集（如已完成4集+填1→跑到第5集）")
                     art_style_dd = gr.Dropdown(
                         choices=["anime", "realistic"],
