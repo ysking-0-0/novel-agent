@@ -10,6 +10,15 @@ Gradio 控制台——长篇小说多媒体剧集生产系统的运行时交互�
 
 启动：python app.py --config config.json
 """
+# ── stdout/stderr 强制 UTF-8（Windows 控制台默认 GBK/CP936，
+#    避免 app.py 自身 print 中文乱码 / UnicodeEncodeError ──
+import sys as _sys
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import os
 import sys
 import json

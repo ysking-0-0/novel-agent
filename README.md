@@ -175,6 +175,8 @@ persistence → media_synthesizer → [route_after_persistence] → text_chunker
 | 片段合成失败 | imageio-ffmpeg 不带 ffprobe | `_audio_duration` 改用 `ffmpeg -i` 解析 stderr |
 | concat 拼接失败 | concat demuxer 按相对路径重复拼接 | concat.txt 用绝对路径 |
 | 图片 URL 过期 | OSS 签名 URL 24 小时失效 | 生成后即时下载落盘 |
+| 字幕显示方块 | libass (ffmpeg `subtitles` 滤镜) 在本环境 HarfBuzz shaping 缺陷，无法渲染 CJK | 改用 **PIL 渲染每句字幕为透明 PNG + ffmpeg overlay 叠加**，绕开 libass |
+| 字幕字体找不到 (Windows原生) | `_detect_cjk_font` 仅写 WSL 路径 `/mnt/c/Windows/Fonts/`，Windows 原生 Python 找不到 → fallback `load_default()` 不支持中文 | 候选列表追加 `C:\Windows\Fonts\` 原生路径（读 `%WINDIR%`），三环境全覆盖 |
 
 **音色映射**：`tts_meta.voice` 字段值（角色名或 `narrator`）→ MiniMax voice_id 通过 `voice_mapping` 配置映射。当前内置音色：
 - 旁白 → `Chinese_gravelly_storyteller_nv1`（沉稳说书人）
@@ -517,3 +519,14 @@ novel_pipeline/
 4. **章节标题正则**：text_chunker 内置中文章节标题模式（第X章/回、Chapter N、卷X），非标准格式小说可能对齐失败，退化为段落边界
 5. **TTS 限流**：MiniMax TTS 对并发请求敏感，默认 tts_concurrency=1（串行）；emotion 仅支持 neutral/happy/sad/angry/disgusted/surprised/calm，其他值自动映射
 6. **生图 URL 时效**：MiniMax 返回的 OSS 签名 URL 24 小时失效，media_synthesizer 生成后即时下载落盘
+
+## 环境兼容性（WSL / Windows 原生）
+
+本项目在 **WSL (Ubuntu)** 下开发与验证，以下问题在 **Windows 原生运行**（直接用 Windows 版 Python 跑 `app.py`/`main.py`）时可能出现，已做兼容处理：
+
+| 问题 | 现象 | 原因 | 处理 |
+|---|---|---|---|
+| 字幕显示方块/乱码 | 开启「字幕」后视频底部字幕全是 □□□ 或不显示 | libass (ffmpeg `subtitles` 滤镜) 在 WSL/Windows 下 HarfBuzz shaping 缺陷，无法渲染 CJK；早期字体探测只查 WSL 路径 `/mnt/c/Windows/Fonts/`，Windows 原生找不到字体 → PIL fallback 到 `load_default()`（不支持中文） | ① 字幕改用 **PIL 渲染 PNG + ffmpeg overlay**，绕开 libass；② `_detect_cjk_font()` 同时探测 `C:\Windows\Fonts\`（读 `%WINDIR%`）、WSL 挂载路径、Linux noto/wqy 三类路径，自动命中当前环境的中文字体 |
+| Gradio 日志乱码 | 控制台「日志流」里中文变成 ?? 或方框、子进程报 `UnicodeEncodeError` | Windows 控制台默认编码 GBK/CP936，`main.py` 的 `print` 默认用 locale 编码输出，而 `app.py` 用 `encoding="utf-8"` 解码子进程 stdout，两端不匹配 → `errors="replace"` 把无法解码的字节替换成乱码 | `main.py` / `app.py` 启动时 `sys.stdout.reconfigure(encoding="utf-8")`，强制所有 `print` 输出 UTF-8 字节，与 Gradio 解码器对齐 |
+
+> **推荐运行环境**：WSL (Ubuntu)。Windows 原生虽已做兼容，但 ffmpeg 静态二进制、字体路径、路径分隔符等仍有边角差异，如遇问题优先回到 WSL。

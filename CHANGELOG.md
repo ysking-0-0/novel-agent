@@ -4,6 +4,28 @@
 
 ---
 
+## [Windows 原生兼容] — 2025-07
+
+在 `747d916`（字幕 PIL 渲染版）基础上修复 **Windows 原生运行**时字幕显示方块、Gradio 日志乱码两个问题。项目原本在 WSL 下开发验证，Windows 原生 Python 运行时存在编码/路径差异，此版本补齐兼容。
+
+### 修复
+
+#### 1. 字幕字体找不到（Windows 原生） — `nodes/media_synthesizer.py`
+- **根因**：`_detect_cjk_font()` 候选列表只有 WSL 挂载路径 `/mnt/c/Windows/Fonts/msyh.ttc`，Windows 原生 Python 找不到该路径 → fallback 到 `ImageFont.load_default()`（不支持中文）→ 渲染出的字幕 PNG 全是方块
+- **修复**：候选列表前置 Windows 原生路径，通过 `os.environ["WINDIR"]` 拼出 `C:\Windows\Fonts\`（兼容非 C 盘安装），追加 `msyh.ttc/msyh.ttf/simhei.ttf/simsun.ttc/Deng.ttf`；保留 WSL 路径与 Linux noto/wqy 路径，三环境统一覆盖
+- 配合既有的「PIL 渲染 PNG + ffmpeg overlay」方案（绕开 libass CJK 渲染缺陷），Windows 原生下字幕可正常显示
+
+#### 2. Gradio 日志乱码（Windows 控制台） — `main.py` / `app.py`
+- **根因**：Windows 控制台默认编码 GBK/CP936，`main.py` 的 `print` 用 locale 编码输出中文字节；而 `app.py` 用 `subprocess.Popen(text=True, encoding="utf-8")` 解码子进程 stdout，两端编码不匹配 → `errors="replace"` 把 GBK 字节替换成乱码方块；部分字符在 GBK 下无法编码还会抛 `UnicodeEncodeError` 中断
+- **修复**：`main.py` / `app.py` 在所有 import 之前对 `sys.stdout` / `sys.stderr` 调用 `reconfigure(encoding="utf-8", errors="replace")`，强制后续所有 `print` 输出 UTF-8 字节，与 Gradio 解码器对齐
+
+### 文档
+- README 新增「环境兼容性（WSL / Windows 原生）」章节，表格说明字幕方块、日志乱码两问题的现象/原因/处理
+- README「七、多媒体合成」坑表追加字幕 libass 缺陷、字体路径两条
+- 注明推荐运行环境为 WSL，Windows 原生为兼容支持
+
+---
+
 ## [Gradio 控制台版] — 2025-07
 
 在 `b077928`（动漫画质+1080p 版）基础上新增 **Gradio Web 控制台**、提示词外部化、黑屏自动修复等功能。此版本即 `main` 分支当前 HEAD。

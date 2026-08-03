@@ -583,12 +583,26 @@ def _audio_duration(path: str) -> float:
 
 
 def _detect_cjk_font() -> Optional[str]:
-    """自动探测系统中的 CJK 字体文件路径（WSL/Windows/Linux）。"""
+    """自动探测系统中的 CJK 字体文件路径（Windows原生 / WSL / Linux）。
+
+    Windows 原生运行时路径为 C:\\Windows\\Fonts\\（反斜杠）；
+    WSL 下为 /mnt/c/Windows/Fonts/（正斜杠挂载）；
+    Linux 下走 noto/wqy。三种环境都覆盖，避免 Windows 原生运行时
+    因路径前缀不对而找不到字体 → fallback 到 load_default() 导致字幕全是方块。
+    """
+    win_dir = os.environ.get("WINDIR") or "C:\\Windows"
+    win_fonts = os.path.join(win_dir, "Fonts")
     candidates = [
-        # WSL → Windows 字体
-        "/mnt/c/Windows/Fonts/msyh.ttc",      # 微软雅黑
-        "/mnt/c/Windows/Fonts/simhei.ttf",     # 黑体
-        "/mnt/c/Windows/Fonts/simsun.ttc",     # 宋体
+        # Windows 原生（C:\\Windows\\Fonts\\，反斜杠）
+        os.path.join(win_fonts, "msyh.ttc"),       # 微软雅黑
+        os.path.join(win_fonts, "msyh.ttf"),
+        os.path.join(win_fonts, "simhei.ttf"),      # 黑体
+        os.path.join(win_fonts, "simsun.ttc"),      # 宋体
+        os.path.join(win_fonts, "Deng.ttf"),
+        # WSL → Windows 字体（/mnt/c/Windows/Fonts/，正斜杠）
+        "/mnt/c/Windows/Fonts/msyh.ttc",
+        "/mnt/c/Windows/Fonts/simhei.ttf",
+        "/mnt/c/Windows/Fonts/simsun.ttc",
         # Linux 常见 CJK 字体
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
@@ -597,6 +611,7 @@ def _detect_cjk_font() -> Optional[str]:
         "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
         # 项目自带
         "./assets/fonts/msyh.ttc",
+        "./assets/fonts/simhei.ttf",
     ]
     for p in candidates:
         if os.path.exists(p):

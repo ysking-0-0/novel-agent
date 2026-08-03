@@ -8,6 +8,18 @@ novel_pipeline.main
   python main.py --config config.yaml        # 使用配置文件覆盖默认值
   python main.py --resume                    # 从断点继续
 """
+# ── stdout/stderr 强制 UTF-8（Windows 控制台默认 GBK/CP936，
+#    Gradio app.py 用 encoding="utf-8" 读子进程 stdout；若 main.py 输出
+#    用 locale 编码，中文字符会被 errors="replace" 替换成乱码方块，
+#    且部分字符在 GBK 下无法编码会抛 UnicodeEncodeError ──必须在最前面
+#    reconfigure，让后续所有 print 输出 UTF-8 字节，与 app.py 解码器对齐。
+import sys as _sys
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import argparse
 import os
 import sys
