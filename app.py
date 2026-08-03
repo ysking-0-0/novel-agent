@@ -543,6 +543,11 @@ def build_ui():
                 rerun_btn.click(
                     fn=rerun_episode, inputs=ep_choices, outputs=ep_task_status,
                 )
+                # 周期刷新集列表下拉：续跑/重跑新生成的集自动出现，不必手动点刷新。
+                # 只更新 choices，不覆盖当前 value（用户选中不变）。
+                timer2 = gr.Timer(value=5)
+                timer2.tick(fn=lambda: gr.Dropdown(choices=episode_dropdown_choices()),
+                            outputs=ep_choices)
 
         with gr.Tab("提示词管理"):
             gr.Markdown("### 📝 在线编辑各 Agent 的 System Prompt\n"

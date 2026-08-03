@@ -870,6 +870,10 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
     cfg = get_config()
     tmp_dir = os.path.join(ep_dir, "_tmp_clips")
     os.makedirs(tmp_dir, exist_ok=True)
+    # WSL 跨文件系统（/mnt/d NTFS）偶发 makedirs 成功但随即目录"消失"的竞态，
+    # 且黑屏重试复用同 ep_dir 时第一次 compose 已 rmtree 此目录——
+    # 在写入关键文件前再确保一次，避免 FileNotFoundError 中断整集。
+    os.makedirs(tmp_dir, exist_ok=True)
 
     # 每张图收集 (path, narration_segment, start_ratio)
     seg_images: Dict[int, List[Dict]] = {}  # segment(1-based) -> [{path, start_ratio}]
@@ -1176,13 +1180,18 @@ def media_synthesizer_node(state: Dict, ep_id_override: str = None) -> Dict:
                         replaced += 1
                 if replaced > 0:
                     print("    [黑屏修复] 重试补回 %d 张，重新合成视频" % replaced)
-                    video_path = compose_video(image_paths, audio_paths, tts_meta, ep_dir, eid,
-                                               image_prompts=prompts)
-                    if video_path:
-                        black_pct2 = _detect_black_frames(video_path)
-                        sz_mb = os.path.getsize(video_path) / (1024 * 1024)
-                        print("[合成] %s 重合成完成: %s (%.1f MB) 黑屏 %.1f%%→%.1f%%"
-                              % (eid, video_path, sz_mb, black_pct, black_pct2))
+                    try:
+                        video_path2 = compose_video(image_paths, audio_paths, tts_meta, ep_dir, eid,
+                                                    image_prompts=prompts)
+                        if video_path2:
+                            video_path = video_path2
+                            black_pct2 = _detect_black_frames(video_path)
+                            sz_mb = os.path.getsize(video_path) / (1024 * 1024)
+                            print("[合成] %s 重合成完成: %s (%.1f MB) 黑屏 %.1f%%→%.1f%%"
+                                  % (eid, video_path, sz_mb, black_pct, black_pct2))
+                    except Exception as e:
+                        # 黑屏重合成失败不丢弃已生成的视频：用首次结果继续
+                        print("    [黑屏修复] 重合成异常(%s)，沿用首次视频" % e)
         elif black_pct > 0:
             print("    [黑屏] 检测到 %.1f%% 暗帧（可接受范围）" % black_pct)
     else:
