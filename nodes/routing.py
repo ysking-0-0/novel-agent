@@ -47,7 +47,12 @@ def route_after_arbiter(state: Dict) -> str:
     if verdict == "pass":
         return "persistence"
     if verdict == "minor_revise":
-        return "material_generator"
+        # minor_revise 也计入重试，否则会无限回 material_generator 重生成（死循环）。
+        # 超限后标记人工复核强制归档，让流程继续推进。
+        if retry >= max_retry:
+            print(f"[仲裁] minor_revise 重试超限({retry}>={max_retry})，标记人工复核后继续归档")
+            return "persistence"
+        return "retry_counter"
     if verdict == "regenerate":
         if retry >= max_retry:
             print(f"[仲裁] 重试超限({retry}>={max_retry})，标记人工复核后继续归档")
