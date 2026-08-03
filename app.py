@@ -115,7 +115,8 @@ def start_production(novel_file, target, art_style, orientation,
     try:
         with _RUN.lock:
             if _RUN.is_running:
-                return "⚠️ 已有任务在运行中，请先停止", "\n".join(_RUN.log_lines[-50:])
+                # ⚠️ 警告写 start_feedback（status_box 被 Timer 每2s覆盖，用户看不到）
+                return refresh_status_simple(), "⚠️ 已有任务在运行中，请先停止后再点续跑/开始"
             _RUN.reset()
             _RUN.is_running = True
 

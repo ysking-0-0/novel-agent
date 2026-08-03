@@ -101,8 +101,13 @@ def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None) -> O
                 br = d.get("base_resp") or {}
                 msg = (br.get("status_msg") or "")[:80]
                 status_code = br.get("status_code")
-                # 用量受限 / 内容审核敏感：直接放弃不重试（重试只会重复失败并占满超时）
-                if "用量" in msg or "limit" in msg.lower() or status_code in (1026, 1027):
+                # rate limit (1002 RPM) 是临时限流，等几秒可恢复——重试而非放弃
+                if status_code == 1002 or "rate limit" in msg.lower():
+                    print("    [生图] 限流(1002 RPM)，等 %ds 重试" % (4 * (attempt + 1)))
+                    time.sleep(4 * (attempt + 1))
+                    continue
+                # 用量耗尽 / 内容审核敏感：直接放弃不重试
+                if "用量" in msg or status_code in (1026, 1027):
                     print("    [生图] 跳过(status=%s): %s" % (status_code, msg or "sensitive/quota"))
                     return None
         except Exception as e:
