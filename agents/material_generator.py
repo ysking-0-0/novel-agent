@@ -23,11 +23,13 @@ class MaterialGeneratorAgent:
 
     def __init__(self):
         self.llm = get_llm(role="production")
-        art_style = getattr(get_config().media, "art_style", "anime")
-        self.system_prompt = load_prompt("material_generator", art_style=art_style)
 
     def generate(self, episode: Dict, revise_instruction: Optional[Dict] = None) -> Dict:
         """生成三类素材。返回 dict 含 script / image_prompts / tts_meta。"""
+        # 每次生成时动态加载 prompt，确保 art_style 切换后立即生效
+        # （__init__ 只调一次，若 Agent 被复用，固化 prompt 会导致旧风格残留）
+        art_style = getattr(get_config().media, "art_style", "anime")
+        system_prompt = load_prompt("material_generator", art_style=art_style)
         memory = get_memory_agent()
         # 取本集关联人物设定档案
         char_ids = set()
@@ -40,7 +42,7 @@ class MaterialGeneratorAgent:
         char_profiles = [c for c in memory.get_character_profiles() if c.get("char_id") in char_ids] if char_ids else []
 
         messages = [
-            SystemMessage(content=self.system_prompt),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=self._build_user_msg(episode, char_profiles, revise_instruction)),
         ]
         resp = self.llm.invoke(messages)

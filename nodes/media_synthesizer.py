@@ -76,12 +76,35 @@ def _image_to_base64(path: str) -> str:
     return "data:image/jpeg;base64," + b
 
 
+def _enhance_prompt_with_style(prompt: str) -> str:
+    """按 art_style 对生图 prompt 做风格增强预处理。
+
+    MiniMax image-01 无显式 style/negative_prompt 参数，风格完全靠 prompt 文本驱动。
+    仅靠句首 "anime style" 几个词会被后续写实描述（muscular/scars 等）冲淡，
+    导致模型渲染成真人质感。这里前置加权风格词 + 追加负面排除词来强化约束。
+    """
+    cfg = get_config()
+    art_style = getattr(cfg.media, "art_style", "anime")
+    if art_style == "anime":
+        # 动漫：前置多重动漫风格同义词形成"风格锚"，追加负面词排除写实
+        prefix = ("anime style, 2d anime illustration, cel shading, "
+                  "flat colors, hand-drawn anime art, manga aesthetic, ")
+        negative = (", no realism, no photorealistic, no 3d render, no real person, "
+                    "no photographic, no skin texture, no live action")
+        return prefix + prompt + negative
+    elif art_style == "realistic":
+        prefix = "realistic photo style, cinematic photography, detailed realistic, "
+        return prefix + prompt
+    return prompt
+
+
 def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None) -> Optional[str]:
     """调用 MiniMax 生图接口，返回图片 URL 或 None。"""
     cfg = get_config()
+    enhanced_prompt = _enhance_prompt_with_style(prompt)
     payload = {
         "model": cfg.media.image_model,
-        "prompt": prompt,
+        "prompt": enhanced_prompt,
         "aspect_ratio": cfg.media.image_aspect_ratio,
     }
     if reference_image_b64:
