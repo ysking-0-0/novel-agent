@@ -191,17 +191,21 @@ persistence → media_synthesizer → [route_after_persistence] → text_chunker
 
 | 知识库 | 键 | 值 |
 |---|---|---|
-| 人物档案库 | char_id | 性格/外貌/能力/关系 |
+| 人物档案库 | char_id | 性格/外貌/能力/关系 + **user_description（用户手填，AI 不可覆盖）** |
 | 时序事件库 | event_id | 因果链/时间顺序 |
 | 伏笔台账 | foreshadow_id | 埋设/回收状态 |
 
 - 向量库（FAISS）按需召回相关历史场景，解决长线伏笔回收，避免上下文溢出
 - 所有 Agent 不得直接改记忆库，统一走 MemoryManagerAgent
 - 每集归档后增量更新（update_from_episode + save）
+- **角色档案双区设计**：`appearance`/`age`/`identity`/`attire`/`personality` 由 plot_parser 每集从小说抽取并 upsert（首次写入后锁定，保证人物一致性）；`user_description` 字段由用户通过「角色档案」Tab 手填，AI 的 upsert 在 `_USER_FIELDS` 保护下**永不覆盖**。material_generator 生图时优先用 `user_description`（加"【用户指定·优先】"前缀传给 LLM），为空才回退 AI 维护的 appearance+attire。
+- **多书切换重置**：`apply_book()` 切书后调 `reset_memory_store()` 清空进程内单例，下次 `get_memory_agent()` 重新加载新书目录的记忆库
 
 ### 九、断点续跑
 
-SqliteSaver 自动保存每个节点完成后的完整 NovelState 快照（thread_id 固定 `novel_main_thread`）。崩溃 / 手动停止 / 断电后，`--resume` 从最新 checkpoint 无缝恢复。`offset` 字节游标 + sqlite 快照双重保障。
+SqliteSaver 自动保存每个节点完成后的完整 NovelState 快照。崩溃 / 手动停止 / 断电后，`--resume` 从最新 checkpoint 无缝恢复。`offset` 字节游标 + sqlite 快照双重保障。
+
+**多书隔离**：thread_id 拼成 `novel_main_thread__<书名>` 前缀，不同书的断点互不串扰。续跑时自动找当前书下完成集数最多的 thread；旧版本（无书名前缀的 `novel_main_thread`）会自动回退兼容。每次一集 END 后续跑会新建 `novel_main_thread__<书名>_resume_N` 形式的增量 thread。
 
 ### 十、条件路由（5 个路由函数）
 
@@ -263,22 +267,36 @@ cp config.example.json config.json
 python app.py --config config.json --port 7860
 ```
 
-浏览器打开 `http://127.0.0.1:7860`，看到四个区块：
+浏览器打开 `http://127.0.0.1:7860`，顶部三个 Tab，生产控制 Tab 下多个区块：
 
 | 区块 | 功能 |
 |---|---|
-| ① 任务配置 | 上传小说 TXT（≤500MB）设目标集数/风格/方向/音量等，点 ▶️ 开始生成 |
+| ① 任务配置 | **当前书下拉 + 新建书** → 上传小说 TXT（≤500MB）设目标集数/风格/方向/音量等 |
+| 文件清单 | 显示当前书全部 txt 的状态（🟢当前在读 / ⏳队列待读 / ⚪未识别），每 5 秒刷新 |
 | ② 实时进度 | 运行状态灯 + 日志流（每 2 秒自动刷新） |
 | ③ 成品浏览 | 选集下拉 → 视频预览（520px 高）+ 讲解文案 + 生图 Prompt |
 | ④ 提示词管理 | 选 Agent → 加载/编辑/保存其 `prompts/*.md`，下一集即时生效 |
+| ⑤ 角色档案（Tab）| 选角色 → 查看AI维护档案 → 编辑「用户描述」（生图优先依据，AI永不覆盖） |
 
 #### Gradio 界面参数详解
+
+**○ 多书管理（生产控制 Tab 顶部）**
+
+每本书在 `novels/<书名>/` 下独立拥有 `checkpoints/ memory/ output/ data/` 四目录，互不干扰——可同时啃多本大长篇，切换书即切换整条进度链（断点/角色档案/成品互不影响）。
+
+| 控件 | 功能 |
+|---|---|
+| 当前书 | 下拉切换已存在的书；切换后自动刷新文件清单/成品列表/角色档案到该书的目录 |
+| 新书店名 | 输入书名（如「人道至尊1-500」）→ 点「📦 新建书」创建目录结构并自动选中 |
+| 文件清单（Markdown 表） | 列出该书 data/ 下全部 txt，标注状态：🟢当前在读(offset) / ⏳队列待读 / ✅已读完 / ⚪未识别。每 5 秒自动刷新，**一眼看出续跑到末尾是否会中断（队列是否为空）** |
+
+> 启动时若 `novels/` 下已有书，默认自动选中第一本，省去手动切。
 
 **① 任务配置区**
 
 | 参数 | 类型 | 默认 | 含义与功效 |
 |---|---|---|---|
-| 上传小说 TXT | 文件 | — | 支持 ≤500MB 纯文本，UTF-8/GBK 自适应。首次运行必须上传；同书重跑可不上传（自动复用 `data/novel.txt`） |
+| 上传小说 TXT | 文件 | — | 支持 ≤500MB 纯文本，UTF-8/GBK 自适应。上传后存到 `novels/<当前书>/data/`；同书重跑可不上传（自动复用该书已存文件） |
 | 目标集数 | 数字 | 4 | **全新运行**=总集数（从头跑几集）；**续跑**=增量（再跑几集，如已完成4集+填1→跑到第5集） |
 | 生图风格 | 下拉 | anime | `anime`=动漫风格（prompt 自动加 `anime style, ancient Chinese mythology art style,` 前缀）；`realistic`=写实风格 |
 | 视频方向 | 下拉 | 横屏 | `横屏 1920×1080 (16:9)`=横屏 1080p；`竖屏 1080×1920 (9:16)`=竖屏（适合手机/抖音） |
@@ -293,8 +311,8 @@ python app.py --config config.json --port 7860
 
 | 按钮 | 功能 |
 |---|---|
-| ▶️ 开始生成 | 全新运行：从小说开头开始，目标集数=总集数。未上传时自动复用 `data/novel.txt` |
-| ♻️ 从断点续跑 | 从上次断点继续：自动找最新断点（已完成集数最多的 thread），目标集数=增量（再跑几集） |
+| ▶️ 开始生成 | 全新运行：从小说开头开始，目标集数=总集数。未上传时自动复用当前书 `data/novel.txt` |
+| ♻️ 从断点续跑 | 从当前书的断点继续：自动找该书完成集数最多的 thread，目标集数=增量（再跑几集） |
 | ⏹️ 停止生成 | 发送停止信号，等当前集生产完成后优雅退出（不杀进程，不丢数据），下次可续跑 |
 
 **② 实时进度区**
@@ -335,56 +353,69 @@ python app.py --config config.json --port 7860
 
 | 场景 | 操作 |
 |---|---|
-| **首次跑 4 集** | 上传 TXT → 目标集数填 4 → 点 ▶️ 开始生成 |
-| **继续跑 1 集** | 目标集数填 1 → 点 ♻️ 从断点续跑（自动从上次第4集后继续） |
-| **同一本书重跑 2 集** | 不上传（复用）→ 目标集数填 2 → 点 ▶️ 开始生成（从头开始） |
-| **换一本书跑** | 上传新 TXT → 目标集数填 N → 点 ▶️ 开始生成 |
+| **首次跑 4 集** | 选/建书 → 上传 TXT → 目标集数填 4 → 点 ▶️ 开始生成 |
+| **继续跑 1 集** | 选当前书 → 目标集数填 1 → 点 ♻️ 从断点续跑（自动从上次第4集后继续） |
+| **同一本书重跑 2 集** | 选当前书（不上传复用）→ 目标集数填 2 → 点 ▶️ 开始生成（从头开始） |
+| **换一本书跑** | 「当前书」下拉切换 或 「新书店名」+📦 新建书 → 上传新 TXT → 开始生成 |
+| **多本大长篇交替跑** | 两个书各自独立断点，切换书即切换进度链，互不影响 |
+| **编辑角色外貌** | 角色档案 Tab → 选角色 → 填「用户描述」→ 保存（下集生图以此为准） |
 | **换动漫→写实风格** | 生图风格选 realistic → 重新开始生成或续跑 |
 | **加字幕** | 勾选「字幕」→ 开始生成或续跑（字幕烧录到视频画面） |
 | **改 Agent 提示词** | 提示词管理 → 选 Agent → 编辑 → 💾 保存 → 下一集生效 |
 
 ### 3-B. 方式二：命令行
 
-先把小说 txt 放到默认位置：
+命令行通过 `--book <书名>` 指定书，storage 路径自动重定向到 `novels/<书名>/` 下（多书隔离）。未传 `--book` 时回退到根目录的旧默认路径（兼容历史用法）。
+
+先把小说 txt 放到对应书的 data 目录：
 
 ```bash
-mkdir -p data
-cp /你的小说路径/某小说.txt data/novel.txt
+mkdir -p "novels/我的书/data"
+cp /你的小说路径/某小说.txt "novels/我的书/data/novel.txt"
 ```
 
-> 也支持放别处，运行时用 `--novel /你的路径.txt` 指定即可。文件越完整越好（几万字起步，百万字也行）；太短（<几千字）可能凑不够一集（系统要求每集至少 3 个场景）。
+> 也支持放别处用 `--novel /你的路径.txt` 指定。文件越完整越好（几万字起步，百万字也行）；太短（<几千字）可能凑不够一集。
 
-**最简：生成 10 集视频**
+**最简：生成 10 集视频（指定书）**
 ```bash
-python main.py --novel ./data/novel.txt --target 10 --config config.json
+python main.py --book "我的书" --novel "novels/我的书/data/novel.txt" --target 10 --config config.json
 ```
 
 **跑完全本**（自动一直跑到小说末尾，生成 N 集）
 ```bash
-python main.py --novel ./data/novel.txt --config config.json
+python main.py --book "我的书" --novel "novels/我的书/data/novel.txt" --config config.json
 ```
 
-**断点续跑**（从上次断点继续，`--target` 为增量即"再跑几集"）
+**断点续跑**（`--target` 为增量即"再跑几集"；`--book` 指定从哪本书的断点续）
 ```bash
-python main.py --resume --target 1 --config config.json   # 已完成4集+再跑1集→跑到第5集
-python main.py --resume --config config.json              # 不指定target=用config.json默认值
+python main.py --book "我的书" --resume --target 1 --config config.json   # 已完成4集+再跑1集→跑到第5集
+python main.py --book "我的书" --resume --config config.json                # 不指定target=用config.json默认值
+```
+
+**超长篇拆多本 txt 自动衔接**（`--novel-queue` 后续本按顺序衔接，读完后自动切下一本）
+```bash
+python main.py --book "人道至尊" --novel "novels/人道至尊/data/novel.txt" \
+  --novel-queue "novels/人道至尊/data/novel_1.txt" "novels/人道至尊/data/novel_2.txt" \
+  --target 20 --config config.json
 ```
 
 **用环境变量方式（不写 config.json）**
 ```bash
 export MINIMAX_API_KEY="sk-cp-你的真实key"
-python main.py --novel ./data/novel.txt --target 5
+python main.py --book "我的书" --novel "novels/我的书/data/novel.txt" --target 5
 ```
 
 > 运行过程中控制台会实时打印进度：`[生产]`/`[评审]`/`[归档]`/`[合成]`/`[进度] 已完成 N 集`。每集约需 3-8 分钟（取决于 LLM 响应和生图/TTS 并发）。
 
 ### 5. 产出在哪里 & 各是什么
 
-成品按单集独立目录归档在 `output/` 下：
+成品按单集独立目录归档在 `novels/<书名>/output/` 下（多书隔离）：
 
 ```
-output/
-├ ep_001/
+novels/人道至尊/
+├ data/
+│  └ novel.txt              # 上传的小说源文本
+├ ep_001/                   # 成品按单集独立目录归档
 │  ├ episode_info.json      # 单集基础信息（剧情概述/因果链/关联伏笔/评审结果）
 │  ├ script.txt             # 整集口播讲解文案（可直接朗读）
 │  ├ image_prompts.json     # 时序化图片 Prompt 列表（List[dict]）
@@ -394,30 +425,29 @@ output/
 │  ├ audio/                 # 合成的每段语音（001.mp3 ...）
 │  └ ep_001.mp4             # ★ 最终讲解视频（图片+语音拼接）
 ├ ep_002/
-└ ...
-memory/
-├ characters.json           # 全局人物档案库
-├ events.json               # 时序事件库
-├ foreshadows.json          # 伏笔台账
-└ character_portraits/      # 角色定妆照（跨集复用，保证人物一致）
-   ├ 钟岳.jpg
-   └ 薪火.jpg
-checkpoints/
-└ checkpoint.sqlite         # 断点快照（--resume 靠它续跑）
+├ memory/                   # 该书独立的记忆库
+│  ├ characters.json        # 全局人物档案库（含 user_description 字段）
+│  ├ events.json            # 时序事件库
+│  ├ foreshadows.json       # 伏笔台账
+│  └ character_portraits/   # 角色定妆照（跨集复用，保证人物一致）
+└ checkpoints/
+   └ checkpoint.sqlite      # 断点快照（--resume 靠它续跑，thread_id 含书名前缀）
 ```
 
-**直接拿 `output/ep_XXX/ep_XXX.mp4` 就是成品视频**，可直接播放或在剪辑软件二次加工。
+**直接拿 `novels/<书名>/output/ep_XXX/ep_XXX.mp4` 就是成品视频**，可直接播放或在剪辑软件二次加工。
 
 ## 目录结构
 
 ```
 novel_pipeline/
 ├── requirements.txt          # 依赖（含 gradio>=4.0）
-├── config.py                 # 全局配置（model/run/storage/media 四组）
+├── config.py                 # 全局配置（model/run/storage/media 四组 + 多书 apply_book）
 ├── config.example.json       # 示例配置文件
 ├── llm_factory.py             # LLM 实例工厂（按角色分层实例化）
 ├── state.py                  # NovelState 核心状态定义
-├── app.py                    # ★ Gradio Web 控制台入口
+├── app.py                    # ★ Gradio Web 控制台入口（多书管理 + 角色档案 Tab）
+├── novels/                   # ★ 多本小说隔离根目录（每书独立 checkpoints/memory/output/data）
+│   └── <书名>/
 ├── prompts/                  # ★ 8 个 Agent 的外部化 System Prompt
 │   ├── __init__.py           # 加载器（load_prompt / save_prompt / list_prompts）
 │   ├── plot_parser.md
@@ -429,17 +459,17 @@ novel_pipeline/
 │   ├── review_atmosphere.md
 │   └── review_arbiter.md
 ├── agents/                   # 9 个 LLM 智能 Agent
-│   ├── memory_manager.py     # 支撑层：全局记忆管理（人物/事件/伏笔 + FAISS）
+│   ├── memory_manager.py     # 支撑层：全局记忆管理（人物/事件/伏笔 + FAISS + user_description 保护）
 │   ├── plot_parser.py        # 生产层：剧情解析
 │   ├── episode_aggregator.py # 生产层：剧集聚合
-│   ├── material_generator.py # 生产层：多媒体素材生成
+│   ├── material_generator.py # 生产层：多媒体素材生成（生图优先用 user_description）
 │   ├── review_character.py   # 评审层：人物设定评审
 │   ├── review_foreshadow.py  # 评审层：伏笔线索评审
 │   ├── review_timeline.py    # 评审层：剧情时序评审
 │   ├── review_atmosphere.py  # 评审层：视听氛围评审
 │   └── review_arbiter.py     # 评审层：评审汇总仲裁
 ├── nodes/                    # 7 个纯代码逻辑节点
-│   ├── text_chunker.py       # 文本分片（offset 游标 + 章节边界对齐）
+│   ├── text_chunker.py       # 文本分片（offset 游标 + 章节边界对齐 + 多本队列衔接）
 │   ├── format_validator.py   # 格式校验（含超限放行保护）
 │   ├── memory_prefetch.py    # 统一记忆预检索
 │   ├── persistence.py        # 持久化归档
@@ -448,7 +478,7 @@ novel_pipeline/
 │   └── retry_counter.py      # 重试计数
 ├── graph/
 │   └── builder.py            # LangGraph StateGraph 构建 + SqliteSaver
-└── main.py                   # 命令行主入口
+└── main.py                   # 命令行主入口（--book 多书隔离参数）
 ```
 
 ## 配置参数
@@ -464,9 +494,9 @@ novel_pipeline/
 | run.target_episode_count | `TARGET_EPISODE_COUNT` | 0(全本) | 目标集数 |
 | run.max_retries | `MAX_RETRIES` | 2 | 单集最大重试（format + review 共享） |
 | run.min/max_scenes_per_episode | - | 3 / 8 | 单集场景数阈值 |
-| storage.output_dir | `OUTPUT_DIR` | ./output | 成品目录 |
-| storage.sqlite_path | `SQLITE_PATH` | ./checkpoints/checkpoint.sqlite | 断点库 |
-| storage.memory_dir | `MEMORY_DIR` | ./memory | 记忆库目录 |
+| storage.output_dir | `OUTPUT_DIR` | ./output | 成品目录（多书隔离时由 `apply_book` 重定向到 `novels/<书名>/output`） |
+| storage.sqlite_path | `SQLITE_PATH` | ./checkpoints/checkpoint.sqlite | 断点库（多书隔离时重定向到 `novels/<书名>/checkpoints/`） |
+| storage.memory_dir | `MEMORY_DIR` | ./memory | 记忆库目录（多书隔离时重定向到 `novels/<书名>/memory`） |
 | storage.enable_vector_retrieval | `ENABLE_VECTOR_RETRIEVAL` | true | 是否启用 FAISS |
 | media.enable_synthesis | `ENABLE_SYNTHESIS` | true | 是否启用合成阶段 |
 | media.image_model | `IMAGE_MODEL` | image-01 | 生图模型 |
@@ -510,6 +540,9 @@ novel_pipeline/
 - ✅ Gradio Web 控制台：上传/设参/实时日志/成品预览/提示词在线编辑
 - ✅ 8 个 Agent 提示词外部化到 `prompts/*.md`，支持风格切换（`{{ART_STYLE}}` 占位符）
 - ✅ 黑屏自动修复：检测到黑屏帧自动重试缺图/占位图并重新合成视频
+- ✅ **多本小说隔离**：`novels/<书名>/` 下独立目录（checkpoints/memory/output/data），命令行 `--book` 参数，thread_id 加书名前缀防串断点，兼容旧版本无前缀断点
+- ✅ **文本识别清单**：Gradio 文件清单 Markdown 实时显示每本 txt 的 🟢当前在读/⏳队列待读/✅已读完/⚪未识别，防续跑到末尾没衔接
+- ✅ **角色档案双区 + 用户可编辑**：user_description 字段 AI 永不覆盖，生图优先用；新增「角色档案」Tab 在线编辑
 
 ## 注意事项
 
