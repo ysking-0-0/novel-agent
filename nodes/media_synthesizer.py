@@ -76,6 +76,19 @@ def _image_to_base64(path: str) -> str:
     return "data:image/jpeg;base64," + b
 
 
+def _style_prefix_negative():
+    """返回当前预设的 (api_prefix, api_negative)。
+    生图、定妆照统一从预设读，无硬编码风格词。
+    """
+    cfg = get_config()
+    preset_name = getattr(cfg.media, "art_style", "anime")
+    from prompts import get_style_preset
+    preset = get_style_preset(preset_name)
+    if not preset:
+        return "", ""
+    return preset.get("api_prefix", ""), preset.get("api_negative", "")
+
+
 def _enhance_prompt_with_style(prompt: str) -> str:
     """按 art_style 对生图 prompt 做风格增强预处理。
 
@@ -84,16 +97,9 @@ def _enhance_prompt_with_style(prompt: str) -> str:
     MiniMax image-01 无显式 negative_prompt 参数，靠 prompt 文本驱动：
     正向锚词强制写明风格/服饰/发型兜底，负面追加排除现代元素。
     """
-    cfg = get_config()
-    preset_name = getattr(cfg.media, "art_style", "anime")
-    from prompts import get_style_preset
-    preset = get_style_preset(preset_name)
-    if preset:
-        prefix = preset.get("api_prefix", "")
-        negative = preset.get("api_negative", "")
-        if prefix or negative:
-            return prefix + prompt + negative
-    # 预设缺失回退（不崩）
+    prefix, negative = _style_prefix_negative()
+    if prefix or negative:
+        return prefix + prompt + negative
     return prompt
 
 
@@ -170,8 +176,14 @@ def get_or_create_portrait(char_id: str, appearance_desc: str, entity_type: str 
 
     if entity_type == "spirit":
         # 灵体/火焰化身（如薪火）：本体是火焰，特殊画法，不走古风服饰约束
+        # 只取预设的 llm_prompt_prefix（风格锚）+ 灵体专用描述，不加 api_prefix（含古风服饰）和 api_negative
+        from prompts import get_style_preset
+        cfg = get_config()
+        preset_name = getattr(cfg.media, "art_style", "anime")
+        preset = get_style_preset(preset_name)
+        style_anchor = preset.get("llm_prompt_prefix", "") if preset else ""
         portrait_prompt = (
-            "ancient Chinese mythology art style, spirit entity reference portrait, front view, "
+            style_anchor + ", spirit entity reference portrait, front view, "
             "neutral dark background. "
             + (appearance_desc or char_id)
             + ". "
@@ -184,18 +196,16 @@ def get_or_create_portrait(char_id: str, appearance_desc: str, entity_type: str 
             "Mystical atmosphere, high detail, consistent character design reference sheet for image-to-image continuity."
         )
     else:
+        # 人物定妆照：api_prefix（风格+服饰+发型锚）前置 + 肖像框架 + 外貌 + AGE LOCK + api_negative
+        prefix, negative = _style_prefix_negative()
         portrait_prompt = (
-            "ancient Chinese mythology art style, character reference portrait, front view, "
+            prefix + "character reference portrait, front view, "
             "neutral background, full body visible. "
             + (appearance_desc or char_id)
             + ". Handsome and heroic if male, beautiful and ethereal if female. "
-            "Ancient Chinese attire matching cultivation realm. "
-            "CLOTHING (ABSOLUTE MANDATORY): 100% ancient Chinese garments only - cross-collar right-lapel robes, wide sleeves, sash-waisted, multi-layered hanfu-style robes, fabric of hemp/silk/brocade/animal hide. ABSOLUTELY NEVER modern T-shirt, shirt, trousers, skirt, zipper, buttons, modern prints. "
-            "FOOTWEAR (MANDATORY): cloth shoes, straw sandals, leather boots, cloud-toe shoes only. ABSOLUTELY NEVER sneakers, leather shoes, modern shoes. "
-            "ACCESSORIES: jade pendant, bone carving, bronze ring, spirit stone pendant only. ABSOLUTELY NEVER watch, glasses, modern jewelry. "
-            "HAIR (ABSOLUTE MANDATORY): long black hair in ancient Chinese style, hair must be LONG and TIED UP into a visible topknot bun or coiled bun secured with jade hairpin or wooden hairpin or bone hairpin. The word 'bun' or 'topknot' MUST appear in the hairstyle description. ABSOLUTELY NEVER modern short hair, NEVER modern hairstyle, NEVER buzz cut, NEVER side part, NEVER any modern haircut, NEVER ponytail with elastic band. "
             "AGE LOCK: the character's apparent age must strictly match the age specified above, NEVER depict as older or younger. "
             "Mystical atmosphere, high detail, consistent character design reference sheet for image-to-image continuity."
+            + negative
         )
     print("    [定妆照] 首次生成 %s (type=%s)" % (char_id, entity_type))
     url = _call_image_api(portrait_prompt, reference_image_b64=None)
