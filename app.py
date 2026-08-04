@@ -31,9 +31,170 @@ from typing import Optional
 import gradio as gr
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import set_config, get_config
+from config import set_config, get_config, apply_book, StorageConfig
 from prompts import load_prompt, save_prompt, list_prompts, ART_STYLES
 from nodes.media_synthesizer import resynthesize_video, regenerate_episode_media
+
+
+# ────────────── 书管理 ──────────────
+_NOVELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "novels")
+
+
+def _book_dir(book_name: str) -> str:
+    return os.path.join(_NOVELS_DIR, book_name or "")
+
+
+def list_books() -> list:
+    """列出 novels/ 下所有书名。"""
+    if not os.path.isdir(_NOVELS_DIR):
+        return []
+    return sorted([d for d in os.listdir(_NOVELS_DIR)
+                   if os.path.isdir(os.path.join(_NOVELS_DIR, d))])
+
+
+def book_dropdown_choices():
+    return [(b, b) for b in list_books()]
+
+
+def create_book(book_name: str):
+    """新建书目录结构。返回下拉更新 + 状态。"""
+    if not book_name or not book_name.strip():
+        return gr.update(), "⚠️ 书名不能为空"
+    name = book_name.strip()
+    bdir = _book_dir(name)
+    try:
+        os.makedirs(os.path.join(bdir, "data"), exist_ok=True)
+        os.makedirs(os.path.join(bdir, "checkpoints"), exist_ok=True)
+        os.makedirs(os.path.join(bdir, "memory"), exist_ok=True)
+        os.makedirs(os.path.join(bdir, "output"), exist_ok=True)
+    except Exception as e:
+        return gr.update(), f"❌ 创建失败: {e}"
+    choices = book_dropdown_choices()
+    return gr.Dropdown(choices=choices, value=name), f"✅ 书 '{name}' 已创建"
+
+
+def _switch_book(book_name: str):
+    """切换当前书：apply_book 重定向 storage 路径，返回书状态文本。
+    不持久化到 config.json（运行期内存覆盖，避免写盘污染其他书）。
+    """
+    if not book_name:
+        return "⚠️ 未选书", "", gr.update(), gr.update()
+    apply_book(book_name)
+    return f"📖 当前书：{book_name}", "", gr.update(), gr.update()
+
+
+def _book_dir(book_name: str) -> str:
+    """返回指定书的根目录绝对路径。"""
+    root = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(root, "novels", book_name)
+
+
+def _scan_book_files(book_name: str) -> list:
+    """扫描指定书 data/ 下所有 txt，返回 [{name, size_mb, path}]。"""
+    data_dir = os.path.join(_book_dir(book_name), "data")
+    if not os.path.isdir(data_dir):
+        return []
+    files = []
+    for fn in sorted(os.listdir(data_dir)):
+        fp = os.path.join(data_dir, fn)
+        if os.path.isfile(fp) and fn.lower().endswith(".txt"):
+            files.append({"name": fn, "size_mb": round(os.path.getsize(fp) / 1024 / 1024, 1), "path": fp})
+    return files
+
+
+def _read_book_progress(book_name: str) -> dict:
+    """从 sqlite 断点读取当前书的进度：当前文件/offset/队列/已完成集数。
+    用 LangGraph SqliteSaver.get_state_history 读取（兼容各种序列化格式）。
+    """
+    db_path = os.path.join(_book_dir(book_name), "checkpoints", "checkpoint.sqlite")
+    if not os.path.exists(db_path):
+        return {}
+    try:
+        from graph import build_graph
+        graph, conn = build_graph(db_path)
+        # 扫描所有 novel_main_thread* 的 thread（兼容旧无前缀 + 新带 book 前缀）
+        import sqlite3 as _sql
+        c2 = _sql.connect(db_path)
+        rows = c2.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE 'novel_main_thread%'"
+        ).fetchall()
+        c2.close()
+        if not rows:
+            conn.close()
+            return {}
+        best = {"done": -1}
+        for (tid,) in rows:
+            try:
+                snaps = list(graph.get_state_history(
+                    {"configurable": {"thread_id": tid}}
+                ))
+                if snaps:
+                    s = snaps[0]
+                    vals = s.values or {}
+                    done = vals.get("completed_episode_count", 0)
+                    if isinstance(done, int) and done > best["done"]:
+                        best = {"thread": tid, "done": done,
+                                "file_path": vals.get("file_path", ""),
+                                "offset": vals.get("offset", 0),
+                                "file_queue": vals.get("file_queue", []),
+                                "completed": done,
+                                "loop_finished": vals.get("loop_finished", False)}
+            except Exception:
+                pass
+        conn.close()
+        return best if best["done"] >= 0 else {}
+    except Exception:
+        return {}
+
+
+def refresh_book_files(book_name: str):
+    """刷新文件清单 + 进度显示。返回 Markdown 文本。
+    标记每本 txt 的状态：🟢当前在读 / ⏳队列待读 / ✅已读完 / ⚪未识别。
+    防止续跑到末尾才发现没衔接。"""
+    if not book_name:
+        return "⚠️ 请先选择书"
+    files = _scan_book_files(book_name)
+    progress = _read_book_progress(book_name)
+    lines = [f"### 📂 {book_name} 文件清单\n"]
+    if not files:
+        lines.append("（data/ 目录无 txt 文件，请上传）")
+    else:
+        # 从断点提取当前文件和队列
+        cur_file = progress.get("file_path", "") if progress else ""
+        cur_file_name = os.path.basename(cur_file) if cur_file else ""
+        queue = progress.get("file_queue", []) if progress else []
+        queue_names = [os.path.basename(p) for p in queue] if queue else []
+        done = progress.get("done", 0) if progress else 0
+        finished = progress.get("loop_finished", False) if progress else False
+        # 判断每本状态
+        lines.append("| 序号 | 文件名 | 大小 | 状态 |")
+        lines.append("|------|--------|------|------|")
+        for i, f in enumerate(files, 1):
+            status = "⚪ 未识别"
+            fname = f["name"]
+            # 匹配当前在读：断点 file_path 的 basename 等于本文件名
+            if cur_file_name and cur_file_name == fname:
+                if finished:
+                    status = "✅ 已读完"
+                else:
+                    off = progress.get("offset", 0)
+                    status = f"🟢 当前在读 (offset={off})"
+            elif fname in queue_names:
+                status = "⏳ 队列待读"
+            elif done > 0 and not queue_names:
+                # 有进度但队列空——当前在读文件可能名字不匹配（旧迁移残留），
+                # 只剩一本且已有进度，标记当前在读
+                status = f"🟢 当前在读 (offset={progress.get('offset',0)})"
+            elif finished and done > 0:
+                status = "✅ 已读完"
+            lines.append(f"| {i} | {fname} | {f['size_mb']} MB | {status} |")
+    lines.append("")
+    if progress:
+        lines.append(f"**断点**：已完成 {progress.get('done', 0)} 集"
+                     + ("，小说已读完" if progress.get("loop_finished") else ""))
+    else:
+        lines.append("**断点**：无（未启动过生产）")
+    return "\n".join(lines)
 
 
 # ────────────── 文件日志（调试用，/tmp/app_debug.log） ──────────────
@@ -64,9 +225,11 @@ _RUN = _RunState()
 
 def _build_run_cmd(novel_path, target, art_style, orientation, tts_speed,
                    bgm_volume, tts_volume, chunk_size, max_retries, resume=False,
-                   novel_queue=None) -> list:
+                   novel_queue=None, book=None) -> list:
     """构造 main.py 运行命令。resume=True 加 --resume。novel_queue: 后续 txt 路径列表。"""
     cmd = [sys.executable, "main.py", "--config", "config.json"]
+    if book:
+        cmd += ["--book", book]
     if resume:
         cmd += ["--resume"]
     elif novel_path:
@@ -110,11 +273,13 @@ def _apply_runtime_config(art_style, orientation, tts_speed, bgm_volume, tts_vol
 
 def start_production(novel_file, target, art_style, orientation,
                      tts_speed, bgm_volume, tts_volume, chunk_size, max_retries,
-                     enable_subtitles=False, resume=False):
-    """启动生产进程。resume=True 时从断点续跑（忽略新上传文件）。"""
+                     enable_subtitles=False, resume=False, book=None):
+    """启动生产进程。resume=True 时从断点续跑（忽略新上传文件）。
+    book: 当前书名，指定后文件存到 novels/<book>/data/，命令传 --book。
+    """
     import traceback as _tb
-    _log_file("start_production 被调用，参数: novel_file=%r type=%s target=%s",
-               novel_file, type(novel_file).__name__, target)
+    _log_file("start_production 被调用，参数: novel_file=%r type=%s target=%s book=%s",
+               novel_file, type(novel_file).__name__, target, book)
     try:
         with _RUN.lock:
             if _RUN.is_running:
@@ -125,10 +290,12 @@ def start_production(novel_file, target, art_style, orientation,
 
         novel_path = ""
         novel_queue = []   # 后续 txt 路径列表
+        # 多书隔离：按书名存到 novels/<book>/data/，无书名回退到根目录 data/
+        data_dir = os.path.join("novels", book, "data") if book else "data"
+        os.makedirs(data_dir, exist_ok=True)
         if resume:
-            _RUN.log_lines.append("[续跑] 从上次断点恢复，不重新上传文件")
+            _RUN.log_lines.append(f"[续跑] 从上次断点恢复 (书={book or '默认'})，不重新上传文件")
         elif novel_file is not None:
-            os.makedirs("data", exist_ok=True)
             # novel_file 可能是单文件(str)或多文件(list)——file_count="multiple" 返回 list
             files = novel_file if isinstance(novel_file, (list, tuple)) else [novel_file]
             _log_file("novel_file 数量=%d 类型=%s", len(files), type(novel_file).__name__)
@@ -142,7 +309,7 @@ def start_production(novel_file, target, art_style, orientation,
                 elif isinstance(src, dict):
                     src = src.get("path") or src.get("name") or ""
                 if isinstance(src, str) and os.path.exists(src):
-                    dest = os.path.join("data", "novel_%d.txt" % fi) if fi else os.path.join("data", "novel.txt")
+                    dest = os.path.join(data_dir, "novel_%d.txt" % fi) if fi else os.path.join(data_dir, "novel.txt")
                     shutil.copy(src, dest)
                     sz_mb = os.path.getsize(dest) / 1024 / 1024
                     orig_name = os.path.basename(src)
@@ -164,8 +331,8 @@ def start_production(novel_file, target, art_style, orientation,
                 f"[单本] 读取: {os.path.basename(novel_path)}"
             )
         else:
-            # 未上传新文件：尝试复用 data/novel.txt
-            cached = os.path.join("data", "novel.txt")
+            # 未上传新文件：尝试复用该书已存的 novel.txt
+            cached = os.path.join(data_dir, "novel.txt")
             if os.path.exists(cached):
                 novel_path = cached
                 sz_mb = os.path.getsize(novel_path) / 1024 / 1024
@@ -184,7 +351,7 @@ def start_production(novel_file, target, art_style, orientation,
 
         cmd = _build_run_cmd(novel_path, target, art_style, orientation,
                              tts_speed, bgm_volume, tts_volume, chunk_size, max_retries,
-                             resume=resume, novel_queue=novel_queue)
+                             resume=resume, novel_queue=novel_queue, book=book)
         _RUN.log_lines.append(f"[启动] 命令: {' '.join(cmd)}")
         _RUN.log_lines.append(f"[参数] 风格={art_style} 方向={orientation} "
                               f"BGM={bgm_volume} TTS音量={tts_volume} 字幕={enable_subtitles} 续跑={resume}")
@@ -225,13 +392,13 @@ def start_production(novel_file, target, art_style, orientation,
 
 
 def resume_production(art_style, orientation, tts_speed, bgm_volume, tts_volume,
-                      chunk_size, max_retries, target, enable_subtitles=False):
+                      chunk_size, max_retries, target, enable_subtitles=False, book=None):
     """从断点续跑：复用上次的 offset/pending_scenes/已完成集数。"""
     # target 仍可覆盖（支持"已完成4集，再追加2集"）
     return start_production(
         None, target, art_style, orientation,
         tts_speed, bgm_volume, tts_volume, chunk_size, max_retries,
-        enable_subtitles=enable_subtitles, resume=True,
+        enable_subtitles=enable_subtitles, resume=True, book=book,
     )
 
 
@@ -438,6 +605,102 @@ def reset_prompt(name):
     return f"✅ {name} 已从 git 恢复", load_prompt_content(name)
 
 
+# ────────────── 书管理 ──────────────
+def list_book_choices():
+    """列出 novels/ 下所有书名，返回 Gradio Dropdown 选项。"""
+    from config import StorageConfig
+    books = StorageConfig.list_books()
+    return [(b, b) for b in books] if books else []
+
+
+def create_book(book_name):
+    """新建一本书的目录结构。"""
+    if not book_name or not book_name.strip():
+        return gr.update(), "⚠️ 请输入书名", "⚠️ 请输入书名"
+    book_name = book_name.strip()
+    bdir = _book_dir(book_name)
+    os.makedirs(os.path.join(bdir, "data"), exist_ok=True)
+    os.makedirs(os.path.join(bdir, "checkpoints"), exist_ok=True)
+    os.makedirs(os.path.join(bdir, "memory"), exist_ok=True)
+    os.makedirs(os.path.join(bdir, "output"), exist_ok=True)
+    # 更新下拉并选中新书
+    return gr.update(choices=list_book_choices(), value=book_name), \
+           f"✅ 新建书 [{book_name}] 完成，可上传 txt", refresh_book_files(book_name)
+
+
+def on_book_change_fileonly(book_name):
+    """切换书时刷新文件清单 + apply_book 路径。"""
+    if not book_name:
+        return "⚠️ 未选书"
+    from config import apply_book
+    apply_book(book_name)
+    return refresh_book_files(book_name)
+
+
+def on_book_change_episode(book_name):
+    """切换书时刷新成品浏览集列表。自行 apply_book 确保路径已切换。"""
+    if not book_name:
+        return gr.update(), None, "", None
+    from config import apply_book
+    apply_book(book_name)  # 幂等，重复调用安全
+    choices = episode_dropdown_choices()
+    first_val = choices[0][1] if choices else None
+    return gr.update(choices=choices, value=first_val), *load_episode_all(first_val)
+
+
+def on_book_change(book_name, ep_dd, ep_video):
+    """切换书时：刷新文件清单 + 集列表 + config 路径（需集列表组件传入）。"""
+    if not book_name:
+        return "⚠️ 未选书", gr.update(), None
+    from config import apply_book
+    apply_book(book_name)
+    file_md = refresh_book_files(book_name)
+    ep_choices = episode_dropdown_choices()
+    first_val = ep_choices[0][1] if ep_choices else None
+    return file_md, gr.update(choices=ep_choices, value=first_val), load_episode_video(first_val)
+
+
+# ────────────── 角色档案 ──────────────
+def list_character_choices():
+    """列出当前书的所有角色名。需先 apply_book 切到对应书。"""
+    try:
+        from agents.memory_manager import get_memory_agent
+        mem = get_memory_agent()
+        chars = mem.get_character_profiles()
+        return [(f"{c.get('char_id','')} · {c.get('name','')}", c.get('char_id', '')) for c in chars]
+    except Exception:
+        return []
+
+
+def load_character_profile(char_id):
+    """加载角色档案到编辑框。返回 user_description + 完整档案 JSON。"""
+    if not char_id:
+        return "", {}, "⚠️ 未选择角色"
+    try:
+        from agents.memory_manager import get_memory_agent
+        mem = get_memory_agent()
+        c = mem.get_character(char_id) or {}
+        user_desc = c.get("user_description", "")
+        # 展示完整档案（只读）
+        display = {k: v for k, v in c.items() if k != "user_description"}
+        return user_desc, display, f"✅ 已加载 [{char_id}]"
+    except Exception as e:
+        return "", {}, f"❌ 加载失败: {e}"
+
+
+def save_character_description(char_id, user_description):
+    """保存用户编辑的角色描述到 characters.json。"""
+    if not char_id:
+        return "⚠️ 未选择角色"
+    try:
+        from agents.memory_manager import get_memory_agent
+        mem = get_memory_agent()
+        mem.save_user_description(char_id, user_description or "")
+        return f"✅ [{char_id}] 的用户描述已保存（下集生图生效）"
+    except Exception as e:
+        return f"❌ 保存失败: {e}"
+
+
 # ────────────── 构建 Gradio 界面 ──────────────
 def build_ui():
     # ①②两列等高靠 gr.Row(equal_height=True)；干预 flex-grow：
@@ -465,6 +728,27 @@ def build_ui():
         gr.Markdown("# 📖 长篇小说多媒体剧集生产控制台")
 
         with gr.Tab("生产控制"):
+            # 当前书选择 + 新建书
+            with gr.Row():
+                book_dd = gr.Dropdown(
+                    choices=list_book_choices(), label="当前书",
+                    info="多书隔离：每本书独立断点/记忆/成品。新建书先在右侧输入书名",
+                    interactive=True, scale=3,
+                )
+                new_book_input = gr.Textbox(label="新书店名", placeholder="如：人道至尊1-500",
+                                            scale=2)
+                create_book_btn = gr.Button("📦 新建书", variant="secondary", scale=1)
+                refresh_book_btn = gr.Button("🔄 刷新清单", scale=1)
+            book_files_md = gr.Markdown("⚠️ 请先选择书", elem_id="book-files-md")
+            # 切换书时刷新文件清单 + config 路径（集列表由 ep_choices 的 change 单独绑定）
+            book_dd.change(fn=on_book_change_fileonly, inputs=book_dd, outputs=book_files_md)
+            create_book_btn.click(fn=create_book, inputs=new_book_input,
+                                  outputs=[book_dd, book_files_md, book_files_md])
+            refresh_book_btn.click(fn=refresh_book_files, inputs=book_dd, outputs=book_files_md)
+            # 周期刷新文件清单（运行中进度变化）
+            book_timer = gr.Timer(value=5)
+            book_timer.tick(fn=refresh_book_files, inputs=book_dd, outputs=book_files_md)
+
             with gr.Row(equal_height=True):
                 with gr.Column(scale=1, elem_id="col-task"):
                     gr.Markdown("### ① 任务配置")
@@ -513,14 +797,14 @@ def build_ui():
                         fn=start_production,
                         inputs=[novel_input, target_input, art_style_dd, orient_dd,
                                 tts_speed_dd, bgm_vol_sl, tts_vol_sl,
-                                chunk_input, retries_input, subtitle_cb],
+                                chunk_input, retries_input, subtitle_cb, book_dd],
                         outputs=[status_box, start_feedback],
                     )
                     resume_btn.click(
                         fn=resume_production,
                         inputs=[art_style_dd, orient_dd, tts_speed_dd,
                                 bgm_vol_sl, tts_vol_sl, chunk_input, retries_input,
-                                target_input, subtitle_cb],
+                                target_input, subtitle_cb, book_dd],
                         outputs=[status_box, start_feedback],
                     )
                     stop_btn.click(fn=stop_production, outputs=status_box)
@@ -552,6 +836,10 @@ def build_ui():
                     fn=refresh_episode_list,
                     outputs=[ep_choices, ep_video, ep_script, ep_prompts],
                 )
+                # 切换书时刷新成品浏览集列表（补绑：ep_choices/ep_video 此时已创建）
+                book_dd.change(fn=on_book_change_episode,
+                               inputs=book_dd,
+                               outputs=[ep_choices, ep_video, ep_script, ep_prompts])
                 ep_choices.change(
                     fn=load_episode_all,
                     inputs=ep_choices,
@@ -592,6 +880,42 @@ def build_ui():
             # 进入标签页自动加载第一个
             prompt_selector.change(fn=load_prompt_content, inputs=prompt_selector, outputs=prompt_editor)
 
+        with gr.Tab("角色档案") as char_tab:
+            gr.Markdown("### 🎭 全局角色描述管理\n"
+                        "AI 解析小说时自动维护角色档案（外貌/年龄/身份等）。\n"
+                        "**用户描述**（下方编辑框）优先级最高——填写后，生图时**严格以此为准**，AI 不会覆盖你的修改。\n"
+                        "留空则 AI 继续用自动维护的外貌描述。")
+            with gr.Row():
+                char_selector = gr.Dropdown(
+                    choices=list_character_choices(), label="选择角色", interactive=True,
+                )
+                char_refresh_btn = gr.Button("🔄 刷新角色列表")
+            char_user_desc = gr.Textbox(
+                label="用户描述（生图优先依据，AI 永不覆盖）",
+                lines=8, max_lines=20, interactive=True,
+                placeholder="填写你对角色外貌/服饰/风格的精确描述，留空则用 AI 自动维护的档案",
+            )
+            with gr.Row():
+                char_load_btn = gr.Button("📂 加载档案")
+                char_save_btn = gr.Button("💾 保存用户描述", variant="primary")
+            char_profile_json = gr.JSON(label="AI 自动维护的档案（只读）")
+            char_status = gr.Textbox(label="操作状态", interactive=False)
+
+            char_load_btn.click(fn=load_character_profile, inputs=char_selector,
+                                outputs=[char_user_desc, char_profile_json, char_status])
+            char_save_btn.click(fn=save_character_description, inputs=[char_selector, char_user_desc],
+                                outputs=char_status)
+            char_selector.change(fn=load_character_profile, inputs=char_selector,
+                                  outputs=[char_user_desc, char_profile_json, char_status])
+            char_refresh_btn.click(fn=lambda: gr.update(choices=list_character_choices()),
+                                   outputs=char_selector)
+            # 进入角色档案 Tab 时自动刷新角色下拉（apply_book 已在切书时重置单例）
+            char_tab.select(fn=lambda: gr.update(choices=list_character_choices()),
+                            outputs=char_selector)
+            # 切换书时也刷新角色下拉
+            book_dd.change(fn=lambda b: gr.update(choices=list_character_choices()),
+                           inputs=book_dd, outputs=char_selector)
+
     return app, css, align_js
 
 
@@ -604,6 +928,13 @@ def main():
 
     if os.path.exists(args.config):
         set_config(args.config)
+
+    # 启动时若有书，默认选中第一本并 apply_book，让成品预览/角色档案立即可见
+    from config import StorageConfig, apply_book
+    books = StorageConfig.list_books()
+    if books:
+        apply_book(books[0])
+        print(f"[启动] 默认选中书: {books[0]}")
 
     app, css, js = build_ui()
     app.launch(server_port=args.port, share=args.share, inbrowser=False,

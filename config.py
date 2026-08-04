@@ -46,9 +46,17 @@ class RunConfig:
 
 @dataclass
 class StorageConfig:
-    """存储路径与介质配置。"""
+    """存储路径与介质配置。
+
+    多书隔离：每本书在 novels/<book_name>/ 下拥有独立的
+    checkpoints/ memory/ output/ data/ 四子目录，互不干扰。
+    config.json 保留全局模型参数；storage 路径运行时由
+    apply_book(name) 重定向。无 book 时回退到项目根目录（兼容旧版）。
+    """
     # 项目根目录（config.py 所在目录），所有路径基于此，不依赖运行时 cwd
     _PROJECT_ROOT: str = os.path.dirname(os.path.abspath(__file__))
+    # 当前书名（None=兼容旧版单书模式，路径用根目录下的默认值）
+    book_name: Optional[str] = None
     # 成品输出目录（绝对路径，不存在自动创建）
     output_dir: str = os.getenv("OUTPUT_DIR",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "output"))
@@ -64,6 +72,50 @@ class StorageConfig:
     )
     # 向量库维度（与 embedding 模型一致）
     vector_dim: int = int(os.getenv("VECTOR_DIM", "1536"))
+
+    @classmethod
+    def book_dir(cls, book_name: str) -> str:
+        """返回指定书名对应的根目录绝对路径。"""
+        root = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(root, "novels", book_name)
+
+    @staticmethod
+    def list_books() -> list:
+        """列出 novels/ 下所有已存在的书名（子目录名）。"""
+        root = os.path.dirname(os.path.abspath(__file__))
+        novels_root = os.path.join(root, "novels")
+        if not os.path.isdir(novels_root):
+            return []
+        return sorted([d for d in os.listdir(novels_root)
+                       if os.path.isdir(os.path.join(novels_root, d))])
+
+
+def apply_book(book_name: Optional[str]):
+    """把当前全局配置的 storage 三路径重定向到 novels/<book_name>/ 下。
+
+    book_name=None 时保持默认（兼容旧版单书模式，路径在项目根目录）。
+    会在 set_config 之后、build_graph 之前调用。
+    """
+    cfg = get_config()
+    if not book_name:
+        cfg.storage.book_name = None
+        return cfg
+    bdir = StorageConfig.book_dir(book_name)
+    os.makedirs(bdir, exist_ok=True)
+    cfg.storage.book_name = book_name
+    cfg.storage.output_dir = os.path.join(bdir, "output")
+    cfg.storage.sqlite_path = os.path.join(bdir, "checkpoints", "checkpoint.sqlite")
+    cfg.storage.memory_dir = os.path.join(bdir, "memory")
+    for d in (cfg.storage.output_dir, cfg.storage.memory_dir,
+              os.path.dirname(cfg.storage.sqlite_path)):
+        os.makedirs(d, exist_ok=True)
+    # 重置 memory_agent 单例，让下次 get_memory_agent 重新加载新书的记忆库
+    try:
+        from agents.memory_manager import reset_memory_store
+        reset_memory_store()
+    except Exception:
+        pass
+    return cfg
 
 
 @dataclass

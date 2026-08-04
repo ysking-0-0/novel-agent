@@ -18,6 +18,22 @@ from prompts import load_prompt
 from config import get_config
 
 
+def _prioritize_char(c: dict) -> dict:
+    """角色档案双区合并：生图用描述优先取 user_description，为空回退到 AI 维护的 appearance。
+    返回扁平化的生图描述，避免 LLM 在两种字段间困惑。
+    """
+    user_desc = (c.get("user_description") or "").strip()
+    ai_appearance = (c.get("appearance") or "").strip()
+    ai_attire = (c.get("attire") or "").strip()
+    out = dict(c)
+    if user_desc:
+        out["image_description"] = f"【用户指定·优先】{user_desc}"
+    else:
+        parts = [p for p in [ai_appearance, ai_attire] if p]
+        out["image_description"] = "，".join(parts) if parts else "（无外貌档案，从剧情推断）"
+    return out
+
+
 class MaterialGeneratorAgent:
     """多媒体素材生成 Agent。"""
 
@@ -40,6 +56,9 @@ class MaterialGeneratorAgent:
                     if cid:
                         char_ids.add(cid)
         char_profiles = [c for c in memory.get_character_profiles() if c.get("char_id") in char_ids] if char_ids else []
+        # 生图优先级：用户描述（user_description）> AI 维护的 appearance+attire
+        # 这里保留完整档案传入，LLM 在 prompt 引导下优先用 user_description
+        char_profiles = [_prioritize_char(c) for c in char_profiles]
 
         messages = [
             SystemMessage(content=system_prompt),
@@ -78,6 +97,9 @@ class MaterialGeneratorAgent:
 【本集悬念】{episode.get('cliffhanger','')}
 
 【全局人物设定档案（生图Prompt必须严格沿用）】
+每个角色的 image_description 字段为生图外貌依据：
+- 若含"用户指定·优先"前缀 → 必须以此描述为准，忽略其他外貌字段
+- 否则用 appearance+attire 组合
 {char_text}{revise_text}
 
 【图片节奏参数】

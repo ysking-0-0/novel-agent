@@ -23,6 +23,13 @@ assets/fonts/
 run.log
 raw_material_output.txt
 
+# 调试用的测试截图/视频（不入库）
+CHECK_*.png
+SUBTITLE_COMPARISON.png
+TEST_FRAME.png
+TEST_SUBTITLE.mp4
+_sub_*.png
+
 # Python
 __pycache__/
 *.pyc

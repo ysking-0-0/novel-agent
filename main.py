@@ -26,7 +26,7 @@ import sys
 import uuid
 from typing import Dict, Any
 
-from config import get_config, set_config
+from config import get_config, set_config, apply_book
 from state import NovelState
 from graph import build_graph
 from agents import get_memory_agent
@@ -67,21 +67,28 @@ def _initial_state(novel_path: str, target: int = None, novel_queue: list = None
     }
 
 
-def _find_latest_thread_id(graph) -> str:
-    """扫描所有 novel_main_thread* 的 thread，返回已完成集数最多的那个 thread_id。
-    每次续跑 END 后会创建 novel_main_thread_resume_N，需要找最新的。
+def _find_latest_thread_id(graph, thread_base: str = "novel_main_thread") -> str:
+    """扫描所有 <thread_base>* 的 thread，返回已完成集数最多的那个 thread_id。
+    每次续跑 END 后会创建 <thread_base>_resume_N，需要找最新的。
+    兼容旧断点：若新前缀扫不到，回退扫无前缀 'novel_main_thread%'。
     """
     import sqlite3
     try:
         db_path = get_config().storage.sqlite_path
         conn = sqlite3.connect(db_path)
         rows = conn.execute(
-            "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE 'novel_main_thread%'"
+            "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE ?",
+            (thread_base + "%",)
         ).fetchall()
+        # 兼容旧断点：新前缀扫不到时回退扫无 book 前缀的旧 thread
+        if not rows and thread_base != "novel_main_thread":
+            rows = conn.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE 'novel_main_thread%'"
+            ).fetchall()
         conn.close()
         if not rows:
-            return "novel_main_thread"
-        best_tid = "novel_main_thread"
+            return thread_base
+        best_tid = thread_base
         best_done = -1
         for (tid,) in rows:
             try:
@@ -97,13 +104,13 @@ def _find_latest_thread_id(graph) -> str:
                 pass
         return best_tid
     except Exception:
-        return "novel_main_thread"
+        return thread_base
 
 
-def _next_resume_thread_id(graph) -> str:
+def _next_resume_thread_id(graph, thread_base: str = "novel_main_thread") -> str:
     """生成一个不与已有 thread 撞名的新 thread_id。
 
-    扫描 checkpoints 表里所有 novel_main_thread_resume_N，取最大序号 +1。
+    扫描 checkpoints 表里所有 <thread_base>_resume_N，取最大序号 +1。
     避免用 completed_episode_count 拼（可能和已有 thread 重名 → 复用已 END
     的 thread 导致 LangGraph 空转中断）。
     """
@@ -112,20 +119,22 @@ def _next_resume_thread_id(graph) -> str:
     try:
         db_path = get_config().storage.sqlite_path
         conn = sqlite3.connect(db_path)
+        resume_prefix = thread_base + "_resume_"
         rows = conn.execute(
-            "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE 'novel_main_thread_resume_%'"
+            "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE ?",
+            (resume_prefix + "%",)
         ).fetchall()
         conn.close()
         max_n = 0
         for (tid,) in rows:
-            m = re.match(r"novel_main_thread_resume_(\d+)$", tid)
+            m = re.match(re.escape(resume_prefix) + r"(\d+)$", tid)
             if m:
                 max_n = max(max_n, int(m.group(1)))
-        return "novel_main_thread_resume_%d" % (max_n + 1)
+        return f"{resume_prefix}{max_n + 1}"
     except Exception:
         # 退化：用时间戳保证唯一
         import time
-        return "novel_main_thread_resume_%d" % int(time.time())
+        return f"{thread_base}_resume_{int(time.time())}"
 
 
 def _resume_state(graph, thread_id: str, target_override: int = None) -> Dict[str, Any] | None:
@@ -156,11 +165,15 @@ def _resume_state(graph, thread_id: str, target_override: int = None) -> Dict[st
 
 
 def run(novel_path: str, target: int = None, resume: bool = False, config_file: str = None,
-        novel_queue: list = None):
-    """主运行入口。"""
+        novel_queue: list = None, book: str = None):
+    """主运行入口。book: 书名，指定后 storage 路径重定向到 novels/<book>/ 下。"""
     if config_file and os.path.exists(config_file):
         set_config(config_file)
 
+    # 多书隔离：在 get_config 之前 apply_book，确保后续所有路径用书的独立目录
+    if book:
+        apply_book(book)
+        print(f"[书] 当前书: {book} → {get_config().storage.output_dir}")
     cfg = get_config()
 
     # 续跑时若未提供 novel，从断点恢复；全新必须提供
@@ -178,14 +191,16 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
     # 构建图
     graph, conn = build_graph(cfg.storage.sqlite_path)
 
-    # 生成 thread_id（断点续跑用）
-    thread_id = "novel_main_thread"
+    # 生成 thread_id（断点续跑用）。多书隔离：加 book 前缀，防不同书串断点
+    book_tag = (book or "default").replace(" ", "_")
+    thread_base = f"novel_main_thread__{book_tag}"
+    thread_id = thread_base
     config = {"configurable": {"thread_id": thread_id}}
 
     # 加载或初始化状态
     if resume:
-        # 续跑时找已完成集数最多的 thread（每次 END 后会创建 novel_main_thread_resume_N）
-        latest_tid = _find_latest_thread_id(graph)
+        # 续跑时找已完成集数最多的 thread（每次 END 后会创建 thread_base_resume_N）
+        latest_tid = _find_latest_thread_id(graph, thread_base)
         if latest_tid != thread_id:
             print(f"[续跑] 检测到最新断点 thread: {latest_tid}")
             thread_id = latest_tid
@@ -212,7 +227,7 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
                 # （如已存在 resume_5 时再次续跑 done=5 会复用已 END 的 resume_5，
                 #  把新 input 塞进已结束的 thread → LangGraph 空转/异常中断，只跑1集就停）。
                 # 改为扫描所有 novel_main_thread_resume_N 取最大序号 +1，保证唯一。
-                thread_id = _next_resume_thread_id(graph)
+                thread_id = _next_resume_thread_id(graph, thread_base)
                 config = {"configurable": {"thread_id": thread_id}}
                 # state 作为全新输入传入（不走 None 恢复）
                 input_state = state
@@ -312,6 +327,7 @@ def main():
     parser.add_argument("--config", default=None, help="配置文件路径 (yaml/json)")
     parser.add_argument("--chunk-size", type=int, default=None, help="单次读取字符上限")
     parser.add_argument("--max-retries", type=int, default=None, help="单集最大重试次数")
+    parser.add_argument("--book", default=None, help="书名（多书隔离：storage 路径重定向到 novels/<book>/）")
     args = parser.parse_args()
 
     # 先加载配置文件（设置 api_key 等），再读全局配置
@@ -333,6 +349,7 @@ def main():
         resume=args.resume,
         config_file=args.config,
         novel_queue=args.novel_queue,
+        book=args.book,
     )
 
 

@@ -84,6 +84,8 @@ class _MemoryStore:
     # ---------- 人物档案 ----------
     # 固定外貌字段：一旦建立就不被后续场景覆盖（保证人物一致性）
     _FIXED_PROFILE_FIELDS = ("appearance", "age", "identity", "personality")
+    # 用户专属字段：AI 永不覆盖/不改写，仅用户通过 UI 编辑
+    _USER_FIELDS = ("user_description",)
 
     def upsert_character(self, char_id: str, profile: Dict):
         with self._lock:
@@ -125,10 +127,22 @@ class _MemoryStore:
             for k, v in profile.items():
                 if k in self._FIXED_PROFILE_FIELDS or k == "attire":
                     continue  # 已上面处理
+                if k in self._USER_FIELDS:
+                    continue  # 用户专属字段，AI 不得覆盖
                 if v is not None:
                     existing[k] = v
             existing["char_id"] = char_id
             self.character_profiles[char_id] = existing
+
+    def save_user_description(self, char_id: str, description: str):
+        """用户通过 UI 编辑角色描述，写回 characters.json。AI 永不覆盖此字段。
+        description 为空串则清除。"""
+        with self._lock:
+            existing = self.character_profiles.get(char_id, {})
+            existing["char_id"] = char_id
+            existing["user_description"] = description or ""
+            self.character_profiles[char_id] = existing
+        self.save()
 
     def get_character(self, char_id: str) -> Optional[Dict]:
         with self._lock:
@@ -263,6 +277,14 @@ def _get_store() -> _MemoryStore:
     return _store
 
 
+def reset_memory_store():
+    """重置进程内单例——apply_book 切书后调用，让下次 get_memory_agent 重新加载新书目录。"""
+    global _store, _agent
+    with _store_lock:
+        _store = None
+    _agent = None
+
+
 # ───────── LLM 包装：记忆更新 / 召回的语义化处理 ─────────
 class MemoryManagerAgent:
     """
@@ -346,6 +368,14 @@ class MemoryManagerAgent:
     # ---------- 查询辅助（评审 Agent 用） ----------
     def get_character_profiles(self) -> List[Dict]:
         return self.store.all_characters()
+
+    def get_character(self, char_id: str):
+        """转发到 store，供 UI 按角色ID加载单条档案。"""
+        return self.store.get_character(char_id)
+
+    def save_user_description(self, char_id: str, description: str):
+        """转发到 store，供 UI 调用。"""
+        self.store.save_user_description(char_id, description)
 
     def get_foreshadow_ledger(self) -> List[Dict]:
         return self.store.all_foreshadows()
