@@ -298,7 +298,7 @@ python app.py --config config.json --port 7860
 |---|---|---|---|
 | 上传小说 TXT | 文件 | — | 支持 ≤500MB 纯文本，UTF-8/GBK 自适应。上传后存到 `novels/<当前书>/data/`；同书重跑可不上传（自动复用该书已存文件） |
 | 目标集数 | 数字 | 4 | **全新运行**=总集数（从头跑几集）；**续跑**=增量（再跑几集，如已完成4集+填1→跑到第5集） |
-| 生图风格 | 下拉 | anime | `anime`=动漫风格（prompt 自动加 `anime style, ancient Chinese mythology art style,` 前缀）；`realistic`=写实风格 |
+| 生图风格 | 下拉 | 仙侠古风-动漫 | 从 `prompts/image_style.json` 预设读取（6 套内置：仙侠古风-动漫/写实、都市现代-动漫/写实、科幻未来-动漫、通用-无约束）。切换小说类型选对应预设即可；编辑/新建预设去「生图风格」Tab |
 | 视频方向 | 下拉 | 横屏 | `横屏 1920×1080 (16:9)`=横屏 1080p；`竖屏 1080×1920 (9:16)`=竖屏（适合手机/抖音） |
 | TTS 语速 | 滑块 | 1.08 | 语音合成语速倍率，0.8~1.3。值越大语速越快（1.0=正常，1.08=紧凑节奏） |
 | BGM 音量 | 滑块 | 0.25 | 背景音乐相对人声的音量比，0.0~0.5。0.25=BGM 声压约为人声的 25%（不抢声） |
@@ -347,7 +347,7 @@ python app.py --config config.json --port 7860
 | ♻️ 从 git 恢复 | `git checkout` 恢复该 prompt 文件到上次提交的版本 |
 | 自动加载 | 切换 Agent 时自动加载其 prompt 到编辑框 |
 
-> `material_generator.md` 中的 `{{ART_STYLE}}` 占位符运行时按风格下拉（anime / realistic）自动替换，无需手写。
+> `material_generator.md` 中的 `{{ART_STYLE}}` 占位符运行时按 `prompts/image_style.json` 预设的 `llm_prompt_prefix` 自动替换，无需手写。预设可在「生图风格」Tab 查看/编辑/新建。
 
 #### 典型操作场景
 
@@ -359,7 +359,7 @@ python app.py --config config.json --port 7860
 | **换一本书跑** | 「当前书」下拉切换 或 「新书店名」+📦 新建书 → 上传新 TXT → 开始生成 |
 | **多本大长篇交替跑** | 两个书各自独立断点，切换书即切换进度链，互不影响 |
 | **编辑角色外貌** | 角色档案 Tab → 选角色 → 填「用户描述」→ 保存（下集生图以此为准） |
-| **换动漫→写实风格** | 生图风格选 realistic → 重新开始生成或续跑 |
+| **换生图风格** | 生图风格下拉选预设（如 仙侠古风-写实）→ 重新开始生成或续跑（下集生图生效）；要编辑/新建预设去「生图风格」Tab |
 | **加字幕** | 勾选「字幕」→ 开始生成或续跑（字幕烧录到视频画面） |
 | **改 Agent 提示词** | 提示词管理 → 选 Agent → 编辑 → 💾 保存 → 下一集生效 |
 
@@ -449,7 +449,8 @@ novel_pipeline/
 ├── novels/                   # ★ 多本小说隔离根目录（每书独立 checkpoints/memory/output/data）
 │   └── <书名>/
 ├── prompts/                  # ★ 8 个 Agent 的外部化 System Prompt
-│   ├── __init__.py           # 加载器（load_prompt / save_prompt / list_prompts）
+│   ├── __init__.py           # 加载器（load_prompt / save_prompt / list_prompts + 风格预设 CRUD）
+│   ├── image_style.json      # ★ 生图风格预设（6 套内置，Gradio「生图风格」Tab 可编辑）
 │   ├── plot_parser.md
 │   ├── episode_aggregator.md
 │   ├── material_generator.md # 含 {{ART_STYLE}} 占位符
@@ -539,6 +540,7 @@ novel_pipeline/
 - ✅ 端到端实跑验证：ep_001 产出 4 图 + 1 段语音 + 37.8 秒讲解视频 (1.9MB)
 - ✅ Gradio Web 控制台：上传/设参/实时日志/成品预览/提示词在线编辑
 - ✅ 8 个 Agent 提示词外部化到 `prompts/*.md`，支持风格切换（`{{ART_STYLE}}` 占位符）
+- ✅ **生图风格预设外部化**：风格词从代码硬编码抽到 `prompts/image_style.json`（6 套内置预设：仙侠古风-动漫/写实、都市现代-动漫/写实、科幻未来-动漫、通用-无约束），每套含 LLM 前缀/API 正向锚词/API 负面排除三字段；新增「生图风格」Tab 可查看/编辑/新建/删除预设，换小说类型选/建对应预设即可，无需改代码
 - ✅ 黑屏自动修复：检测到黑屏帧自动重试缺图/占位图并重新合成视频
 - ✅ **多本小说隔离**：`novels/<书名>/` 下独立目录（checkpoints/memory/output/data），命令行 `--book` 参数，thread_id 加书名前缀防串断点，兼容旧版本无前缀断点
 - ✅ **文本识别清单**：Gradio 文件清单 Markdown 实时显示每本 txt 的 🟢当前在读/⏳队列待读/✅已读完/⚪未识别，防续跑到末尾没衔接

@@ -1,0 +1,35 @@
+{
+  "_说明": "全局生图风格预设。切换风格=切换预设。Gradio「生图风格」Tab 可查看/编辑/新建预设。art_style 下拉选的值=这里的预设名。每套预设含三字段：llm_prompt_prefix（注入material_generator的{{ART_STYLE}}，给LLM看）、api_prefix（生图API层前置锚词，给模型看）、api_negative（生图API层负面排除词）。换不同类型小说时选对应预设即可。",
+  "presets": {
+    "仙侠古风-动漫": {
+      "llm_prompt_prefix": "anime style, ancient Chinese mythology art style",
+      "api_prefix": "anime style, 2d anime illustration, cel shading, flat colors, hand-drawn anime art, manga aesthetic, ancient Chinese mythology setting, ancient hanfu robes with cross-collar and wide sleeves, long black hair tied in ancient topknot bun with hairpin, no modern elements, ",
+      "api_negative": ", no realism, no photorealistic, no 3d render, no real person, no photographic, no skin texture, no live action, no short hair, no modern haircut, no buzz cut, no crew cut, no side part, no modern hairstyle, no T-shirt, no shirt, no western clothes, no suit, no trousers, no skirt, no zipper, no buttons, no modern prints, no collar, no red scarf, no necktie, no sneakers, no leather shoes, no modern shoes, no watch, no glasses, no modern jewelry, no modern building, no electric wire, no neon light, no concrete"
+    },
+    "仙侠古风-写实": {
+      "llm_prompt_prefix": "realistic photo style, ancient Chinese mythology art style",
+      "api_prefix": "realistic photo style, cinematic photography, detailed realistic, ancient Chinese mythology setting, ancient hanfu robes with cross-collar and wide sleeves, long black hair tied in ancient topknot bun with hairpin, no modern elements, ",
+      "api_negative": ", no anime, no 2d, no cel shading, no cartoon, no short hair, no modern haircut, no buzz cut, no crew cut, no side part, no modern hairstyle, no T-shirt, no shirt, no western clothes, no suit, no trousers, no skirt, no zipper, no buttons, no modern prints, no collar, no red scarf, no necktie, no sneakers, no leather shoes, no modern shoes, no watch, no glasses, no modern jewelry, no modern building, no electric wire, no neon light, no concrete"
+    },
+    "都市现代-动漫": {
+      "llm_prompt_prefix": "anime style, modern urban setting",
+      "api_prefix": "anime style, 2d anime illustration, cel shading, flat colors, hand-drawn anime art, manga aesthetic, modern urban setting, contemporary clothing, ",
+      "api_negative": ", no realism, no photorealistic, no 3d render, no real person, no photographic, no skin texture, no live action, no ancient clothes, no hanfu, no topknot, no mythological setting"
+    },
+    "都市现代-写实": {
+      "llm_prompt_prefix": "realistic photo style, modern urban setting",
+      "api_prefix": "realistic photo style, cinematic photography, detailed realistic, modern urban setting, contemporary clothing, ",
+      "api_negative": ", no anime, no 2d, no cel shading, no cartoon, no ancient clothes, no hanfu, no topknot, no mythological setting"
+    },
+    "科幻未来-动漫": {
+      "llm_prompt_prefix": "anime style, sci-fi cyberpunk setting",
+      "api_prefix": "anime style, 2d anime illustration, cel shading, flat colors, hand-drawn anime art, manga aesthetic, sci-fi cyberpunk setting, futuristic technology, neon lights, ",
+      "api_negative": ", no realism, no photorealistic, no 3d render, no real person, no photographic, no skin texture, no live action, no ancient clothes, no hanfu, no topknot, no mythological setting"
+    },
+    "通用-无约束": {
+      "llm_prompt_prefix": "",
+      "api_prefix": "",
+      "api_negative": ""
+    }
+  }
+}

@@ -32,7 +32,7 @@ import gradio as gr
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import set_config, get_config, apply_book, StorageConfig
-from prompts import load_prompt, save_prompt, list_prompts, ART_STYLES
+from prompts import load_prompt, save_prompt, list_prompts, list_style_presets, get_style_preset, save_style_preset, delete_style_preset
 from nodes.media_synthesizer import resynthesize_video, regenerate_episode_media
 
 
@@ -701,6 +701,55 @@ def save_character_description(char_id, user_description):
         return f"❌ 保存失败: {e}"
 
 
+# ────────────── 生图风格 ──────────────
+def load_style_preset_ui(preset_name):
+    """加载指定预设到编辑框。返回 (llm_prefix, api_prefix, api_negative, status)。"""
+    if not preset_name:
+        return "", "", "", "⚠️ 未选择预设"
+    p = get_style_preset(preset_name)
+    if not p:
+        return "", "", "", f"❌ 预设 [{preset_name}] 不存在"
+    return p.get("llm_prompt_prefix", ""), p.get("api_prefix", ""), \
+           p.get("api_negative", ""), f"✅ 已加载预设 [{preset_name}]"
+
+
+def save_style_preset_ui(preset_name, llm_prefix, api_prefix, api_negative):
+    """保存编辑后的预设。"""
+    if not preset_name:
+        return "⚠️ 未选择预设", gr.update(choices=list_style_presets())
+    try:
+        save_style_preset(preset_name, llm_prefix, api_prefix, api_negative)
+        return f"✅ 预设 [{preset_name}] 已保存（下集生图生效）", gr.update(choices=list_style_presets())
+    except Exception as e:
+        return f"❌ 保存失败: {e}", gr.update(choices=list_style_presets())
+
+
+def create_style_preset_ui(preset_name):
+    """新建空预设。"""
+    if not preset_name or not preset_name.strip():
+        return "⚠️ 请输入预设名", gr.update(), "", "", ""
+    preset_name = preset_name.strip()
+    existing = list_style_presets()
+    if preset_name in existing:
+        return f"⚠️ 预设 [{preset_name}] 已存在", gr.update(choices=existing, value=preset_name), "", "", ""
+    save_style_preset(preset_name, "", "", "")
+    return f"✅ 新建空预设 [{preset_name}]，请编辑后保存", \
+           gr.update(choices=list_style_presets(), value=preset_name), "", "", ""
+
+
+def delete_style_preset_ui(preset_name):
+    """删除预设。"""
+    if not preset_name:
+        return "⚠️ 未选择预设", gr.update()
+    try:
+        delete_style_preset(preset_name)
+        remaining = list_style_presets()
+        new_val = remaining[0] if remaining else None
+        return f"✅ 已删除 [{preset_name}]", gr.update(choices=remaining, value=new_val)
+    except Exception as e:
+        return f"❌ 删除失败: {e}", gr.update(choices=list_style_presets())
+
+
 # ────────────── 构建 Gradio 界面 ──────────────
 def build_ui():
     # ①②两列等高靠 gr.Row(equal_height=True)；干预 flex-grow：
@@ -758,9 +807,9 @@ def build_ui():
                     target_input = gr.Number(label="目标集数", value=1, precision=0,
                                               info="全新运行=总集数；续跑=追加几集（如已完成4集+填1→跑到第5集）")
                     art_style_dd = gr.Dropdown(
-                        choices=["anime", "realistic"],
-                        value="anime", label="生图风格",
-                        info="anime=动漫 / realistic=写实"
+                        choices=list_style_presets(),
+                        value="仙侠古风-动漫", label="生图风格",
+                        info="从「生图风格」Tab 可编辑/新建预设；切换后下集生图生效"
                     )
                     orient_dd = gr.Dropdown(
                         choices=["横屏 1920x1080 (16:9)", "竖屏 1080x1920 (9:16)"],
@@ -915,6 +964,50 @@ def build_ui():
             # 切换书时也刷新角色下拉
             book_dd.change(fn=lambda b: gr.update(choices=list_character_choices()),
                            inputs=book_dd, outputs=char_selector)
+
+        with gr.Tab("生图风格"):
+            gr.Markdown("### 🎨 全局生图风格预设\n"
+                        "所有生图请求的最终风格由预设控制：**LLM 前缀**注入 material_generator prompt 引导 LLM 基调；"
+                        "**API 正向锚词**前置到生图 API 请求强制风格/服饰/发型（即使 LLM 漏写也兜底）；"
+                        "**API 负面排除**追加排除现代元素。\n"
+                        "切换小说类型（仙侠/都市/科幻）时，选对应预设或新建一套。编辑保存后**下集生图立即生效**。")
+            with gr.Row():
+                style_selector = gr.Dropdown(
+                    choices=list_style_presets(), label="选择预设", interactive=True,
+                )
+                style_load_btn = gr.Button("📂 加载")
+                style_save_btn = gr.Button("💾 保存", variant="primary")
+                style_delete_btn = gr.Button("🗑️ 删除", variant="stop")
+            style_new_name = gr.Textbox(label="新预设名", placeholder="如：赛博朋克-动漫")
+            style_create_btn = gr.Button("✨ 新建预设", variant="secondary")
+            gr.Markdown("**① LLM 前缀**（注入 material_generator.md 的 `{{ART_STYLE}}`，引导 LLM 生成对应风格基调的 prompt）")
+            style_llm_prefix = gr.Textbox(
+                label="LLM prompt 前缀", lines=2, max_lines=4, interactive=True,
+                placeholder="如：anime style, ancient Chinese mythology art style",
+            )
+            gr.Markdown("**② API 正向锚词**（前置到生图 API 请求，强制风格/服饰/发型，兜底防 LLM 漏写）")
+            style_api_prefix = gr.Textbox(
+                label="API 正向锚词", lines=3, max_lines=6, interactive=True,
+                placeholder="如：anime style, 2d anime illustration, ancient hanfu robes, topknot bun...",
+            )
+            gr.Markdown("**③ API 负面排除**（追加到生图 API 请求，排除不想要元素）")
+            style_api_negative = gr.Textbox(
+                label="API 负面排除", lines=3, max_lines=6, interactive=True,
+                placeholder="如：no realism, no short hair, no T-shirt, no red scarf...",
+            )
+            style_status = gr.Textbox(label="操作状态", interactive=False)
+
+            style_load_btn.click(fn=load_style_preset_ui, inputs=style_selector,
+                                 outputs=[style_llm_prefix, style_api_prefix, style_api_negative, style_status])
+            style_save_btn.click(fn=save_style_preset_ui,
+                                 inputs=[style_selector, style_llm_prefix, style_api_prefix, style_api_negative],
+                                 outputs=[style_status, style_selector])
+            style_delete_btn.click(fn=delete_style_preset_ui, inputs=style_selector,
+                                   outputs=[style_status, style_selector])
+            style_create_btn.click(fn=create_style_preset_ui, inputs=style_new_name,
+                                   outputs=[style_status, style_selector, style_llm_prefix, style_api_prefix, style_api_negative])
+            style_selector.change(fn=load_style_preset_ui, inputs=style_selector,
+                                  outputs=[style_llm_prefix, style_api_prefix, style_api_negative, style_status])
 
     return app, css, align_js
 
