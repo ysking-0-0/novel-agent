@@ -3,12 +3,12 @@
   "presets": {
     "仙侠古风-动漫": {
       "llm_prompt_prefix": "anime style, ancient Chinese mythology art style",
-      "api_prefix": "anime style, 2d anime illustration, cel shading, flat colors, hand-drawn anime art, manga aesthetic, ancient Chinese mythology setting, ancient hanfu robes, long black hair in topknot bun, ",
+      "api_prefix": "anime style, 2d anime illustration, cel shading, flat colors, hand-drawn anime art, manga aesthetic, ancient Chinese mythology setting, ancient hanfu robes, long black hair past shoulders tied in topknot bun with hairpin, hair must be long and tied up, never short hair, ",
       "api_negative": ", no modern elements, no realism"
     },
     "仙侠古风-写实": {
       "llm_prompt_prefix": "realistic photo style, ancient Chinese mythology art style",
-      "api_prefix": "realistic photo style, cinematic photography, detailed realistic, ancient Chinese mythology setting, ancient hanfu robes, long black hair in topknot bun, ",
+      "api_prefix": "realistic photo style, cinematic photography, detailed realistic, ancient Chinese mythology setting, ancient hanfu robes, long black hair past shoulders tied in topknot bun with hairpin, hair must be long and tied up, never short hair, ",
       "api_negative": ", no modern elements, no anime"
     },
     "都市现代-动漫": {
