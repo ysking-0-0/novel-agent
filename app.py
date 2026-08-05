@@ -20,6 +20,7 @@ for _stream in (_sys.stdout, _sys.stderr):
         pass
 
 import os
+import re
 import sys
 import json
 import time
@@ -89,16 +90,74 @@ def _book_dir(book_name: str) -> str:
     return os.path.join(root, "novels", book_name)
 
 
-def _scan_book_files(book_name: str) -> list:
-    """扫描指定书 data/ 下所有 txt，返回 [{name, size_mb, path}]。"""
-    data_dir = os.path.join(_book_dir(book_name), "data")
-    if not os.path.isdir(data_dir):
-        return []
+def _resolve_book_source_path(book_name: str, rel_path: str) -> str:
+    """把断点里记录的（可能为相对路径的）file_path 解析成绝对路径。
+
+    断点 file_path 常见两种形态：
+      ../人道至尊(1-500章).txt   —— 相对运行目录（novel_pipeline/）指向真实源文件
+      data/novel.txt            —— 相对书目录指向 data/ 上传副本
+    依次尝试相对 cwd / 书目录 / 书目录/data，取第一个真实存在的文件。
+    """
+    if not rel_path:
+        return ""
+    book_dir = _book_dir(book_name)
+    candidates = [
+        os.path.abspath(rel_path),
+        os.path.abspath(os.path.join(book_dir, rel_path)),
+        os.path.abspath(os.path.join(book_dir, "data", rel_path)),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return candidates[0]
+
+
+def _scan_all_source_files(book_name: str, progress: dict) -> list:
+    """扫描全书源文件清单（供总体进度统计）。
+
+    优先用断点 file_path 所在目录（真实源文件，例如 novel_pipeline/ 上一级的
+    多本 txt）；无断点或解析不到再回退 data/ 上传目录。
+    按文件名首个数字排序（1-500 → 501-1000 → 1001-1500 的阅读顺序），
+    返回 [{name, size_mb, size_bytes, path}]。
+    """
+    cur_file = (progress or {}).get("file_path", "")
+    cur_abs = _resolve_book_source_path(book_name, cur_file) if cur_file else ""
+    dirs = []
+    if cur_abs:
+        d = os.path.dirname(cur_abs)
+        if os.path.isdir(d):
+            dirs.append(d)
+    dirs.append(os.path.join(_book_dir(book_name), "data"))
+
     files = []
-    for fn in sorted(os.listdir(data_dir)):
-        fp = os.path.join(data_dir, fn)
-        if os.path.isfile(fp) and fn.lower().endswith(".txt"):
-            files.append({"name": fn, "size_mb": round(os.path.getsize(fp) / 1024 / 1024, 1), "path": fp})
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            fp = os.path.join(d, fn)
+            if os.path.isfile(fp) and fn.lower().endswith(".txt"):
+                sz = os.path.getsize(fp)
+                files.append({"name": fn, "size_mb": round(sz / 1024 / 1024, 1),
+                              "size_bytes": sz, "path": fp})
+        if files:  # 找到第一个含 txt 的目录即止，避免与 data/ 重复统计
+            break
+
+    # 系列过滤：源目录里可能混有辅助 txt（如 生图频率描述.txt）。
+    # 只保留与当前在读文件同一"系列前缀"（数字段之前的部分）的文件；
+    # 无前缀或匹配不到时保留全部。
+    if cur_abs and os.path.isfile(cur_abs):
+        m = re.search(r"\d", os.path.basename(cur_abs))
+        if m and m.start() > 0:
+            prefix = os.path.basename(cur_abs)[: m.start()]
+            series = [f for f in files if f["name"].startswith(prefix)]
+            if series:
+                files = series
+
+    def _sort_key(f):
+        m = re.search(r"(\d+)", f["name"])
+        return (0, int(m.group(1))) if m else (1, f["name"])
+
+    files.sort(key=_sort_key)
     return files
 
 
@@ -153,8 +212,8 @@ def refresh_book_files(book_name: str):
     防止续跑到末尾才发现没衔接。"""
     if not book_name:
         return "⚠️ 请先选择书"
-    files = _scan_book_files(book_name)
     progress = _read_book_progress(book_name)
+    files = _scan_all_source_files(book_name, progress)
     lines = [f"### 📂 {book_name} 文件清单\n"]
     if not files:
         lines.append("（data/ 目录无 txt 文件，请上传）")
@@ -164,6 +223,15 @@ def refresh_book_files(book_name: str):
         cur_file_name = os.path.basename(cur_file) if cur_file else ""
         queue = progress.get("file_queue", []) if progress else []
         queue_names = [os.path.basename(p) for p in queue] if queue else []
+        # 队列为空但源目录还有后续文件（旧断点未记录队列）→ 按阅读顺序视为待读
+        if not queue_names and cur_file_name:
+            seen_cur = False
+            for f in files:
+                if f["name"] == cur_file_name:
+                    seen_cur = True
+                    continue
+                if seen_cur:
+                    queue_names.append(f["name"])
         done = progress.get("done", 0) if progress else 0
         finished = progress.get("loop_finished", False) if progress else False
         # 判断每本状态
@@ -194,7 +262,56 @@ def refresh_book_files(book_name: str):
                      + ("，小说已读完" if progress.get("loop_finished") else ""))
     else:
         lines.append("**断点**：无（未启动过生产）")
+
+    # ── 总体进度：全书（全部 txt 累计字节）读到百分之几 + 预计剩余集数 ──
+    prog_line = _format_overall_progress(progress, files)
+    if prog_line:
+        lines.append(prog_line)
     return "\n".join(lines)
+
+
+def _format_overall_progress(progress: dict, files: list) -> str:
+    """根据断点（当前文件/offset/已完成集数）+ 文件清单计算：
+    1) 已读到全书累计字节的百分比
+    2) 按已消耗字节/集数估算剩余可跑集数
+    返回单行字符串；数据不足时返回空串。"""
+    if not progress or not files:
+        return ""
+    cur_file = progress.get("file_path", "")
+    cur_name = os.path.basename(cur_file)
+    offset = progress.get("offset", 0) or 0
+    done = progress.get("done", 0) or 0
+    loop_finished = progress.get("loop_finished", False)
+
+    # 累计：当前文件之前的文件全量 + 当前文件内 offset
+    total_bytes = 0
+    consumed_bytes = 0
+    cur_found = False
+    for f in files:
+        size = f.get("size_bytes") or int(f["size_mb"] * 1024 * 1024)  # 优先精确字节
+        total_bytes += size
+        if cur_found:
+            continue  # 当前文件之后的文件不计入已读
+        if f["name"] == cur_name:
+            consumed_bytes += min(offset, size)
+            cur_found = True
+        else:
+            consumed_bytes += size
+    if total_bytes <= 0:
+        return ""
+    pct = consumed_bytes / total_bytes * 100.0
+    if loop_finished:
+        pct = 100.0
+
+    # 估算剩余集数：按已消耗字节 / 已完成集数 得每集平均消耗
+    est = ""
+    if done > 0 and consumed_bytes > 0:
+        avg = consumed_bytes / done
+        remaining_bytes = max(0, total_bytes - consumed_bytes)
+        remain = remaining_bytes / avg
+        est = f"，预计还能跑 **约 {remain:.0f} 集**（按每集约 {avg/1024:.0f} KB 估算）"
+    return (f"**总体进度**：已读到全书 **{pct:.1f}%**"
+            f"（{consumed_bytes/1024/1024:.1f}/{total_bytes/1024/1024:.1f} MB）{est}")
 
 
 # ────────────── 文件日志（调试用，/tmp/app_debug.log） ──────────────
