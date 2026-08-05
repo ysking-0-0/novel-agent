@@ -32,6 +32,7 @@ from nodes import (
     persistence_node, retry_counter_node, media_synthesizer_node,
     route_after_aggregation, route_after_format_check,
     route_after_arbiter, route_after_persistence, route_after_chunking,
+    route_after_media_quality,
 )
 from config import get_config
 
@@ -76,6 +77,11 @@ def _force_pack_node(state: Dict) -> Dict:
     return aggregator.invoke(forced_state)
 
 
+def _termination_check_node(state: Dict) -> Dict:
+    """终止判断占位节点：无实际逻辑，仅作为 media_synthesizer 质检合格后的路由跳板。"""
+    return {}
+
+
 def build_graph(db_path: str = None):
     """构建并编译 LangGraph，返回 compiled graph。
 
@@ -104,6 +110,7 @@ def build_graph(db_path: str = None):
     g.add_node("retry_counter", retry_counter_node)
     g.add_node("persistence", persistence_node)
     g.add_node("media_synthesizer", media_synthesizer_node)
+    g.add_node("termination_check", _termination_check_node)
 
     # ---------- 入口 ----------
     g.add_edge(START, "text_chunker")
@@ -169,10 +176,19 @@ def build_graph(db_path: str = None):
     # retry_counter → material_generator（整集重生成）
     g.add_edge("retry_counter", "material_generator")
 
-    # persistence → media_synthesizer → 条件路由（终止判断）
+    # persistence → media_synthesizer → 质检路由（合格→终止判断；不合格→整集重生成）
     g.add_edge("persistence", "media_synthesizer")
     g.add_conditional_edges(
         "media_synthesizer",
+        route_after_media_quality,
+        {
+            "termination_check": "termination_check",
+            "retry_counter": "retry_counter",
+        },
+    )
+    # 终止判断（原 route_after_persistence）：达到目标/读完 → END，否则回 text_chunker
+    g.add_conditional_edges(
+        "termination_check",
         route_after_persistence,
         {
             "text_chunker": "text_chunker",

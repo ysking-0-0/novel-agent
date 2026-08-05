@@ -65,6 +65,8 @@ class NovelState(TypedDict, total=False):
     # ───────── 多媒体合成（media_synthesizer 产出） ─────────
     # 本集合成视频的本地路径（合成失败为 None）
     video_path: Optional[str]
+    # 视频质检结果：黑屏/灰屏是否达标（True=通过，False=不合格需整集重生成）
+    video_quality_ok: bool
 
 
 def initial_state(file_path: str,

@@ -8,6 +8,7 @@ from .routing import (
     route_after_arbiter,
     route_after_persistence,
     route_after_chunking,
+    route_after_media_quality,
 )
 from .retry_counter import retry_counter_node
 from .media_synthesizer import media_synthesizer_node
@@ -22,6 +23,7 @@ __all__ = [
     "route_after_arbiter",
     "route_after_persistence",
     "route_after_chunking",
+    "route_after_media_quality",
     "retry_counter_node",
     "media_synthesizer_node",
 ]

@@ -87,6 +87,30 @@ def route_after_persistence(state: Dict) -> str:
     return "text_chunker"
 
 
+# ---------- 步骤 12：媒体质检后路由 ----------
+def route_after_media_quality(state: Dict) -> str:
+    """媒体合成质检结果路由：
+    - video_quality_ok=True → 正常进入终止判断（回 text_chunker / END）
+    - video_quality_ok=False 且未超重试 → 回 material_generator 整集重新生成
+    - video_quality_ok=False 且已超重试 → 标记人工复核后放行（防死循环）
+    """
+    quality_ok = state.get("video_quality_ok", True)
+    if quality_ok:
+        return "termination_check"
+    cfg = get_config()
+    max_retry = cfg.run.max_retries
+    retry = state.get("retry_count", 0)
+    if retry < max_retry:
+        print(f"[质检] 视频不合格，回素材生成整集重生成 (retry={retry}/{max_retry})")
+        return "retry_counter"
+    print(f"[质检] 重试超限({retry}>={max_retry})，标记人工复核后放行")
+    rr = state.get("review_result") or {}
+    rr["manual_review"] = True
+    rr["manual_review_reason"] = "media_quality_exhausted"
+    state["review_result"] = rr
+    return "termination_check"
+
+
 # ---------- 循环出口：text_chunker 读完后判断 ----------
 def route_after_chunking(state: Dict) -> str:
     """文末 + 无 pending → 直接 END；否则进入剧情解析。

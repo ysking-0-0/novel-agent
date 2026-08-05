@@ -115,7 +115,7 @@ def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None) -> O
     if reference_image_b64:
         payload["reference_image"] = reference_image_b64
 
-    for attempt in range(3):
+    for attempt in range(6):
         try:
             r = _get_session().post(
                 _base_url() + "/image_generation",
@@ -131,8 +131,9 @@ def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None) -> O
                 status_code = br.get("status_code")
                 # rate limit (1002 RPM) 是临时限流，等几秒可恢复——重试而非放弃
                 if status_code == 1002 or "rate limit" in msg.lower():
-                    print("    [生图] 限流(1002 RPM)，等 %ds 重试" % (4 * (attempt + 1)))
-                    time.sleep(4 * (attempt + 1))
+                    wait = 6 * (attempt + 1)
+                    print("    [生图] 限流(1002 RPM)，等 %ds 重试" % wait)
+                    time.sleep(wait)
                     continue
                 # 用量耗尽 / 内容审核敏感：直接放弃不重试
                 if "用量" in msg or status_code in (1026, 1027):
@@ -140,7 +141,7 @@ def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None) -> O
                     return None
         except Exception as e:
             print("    [生图] attempt %d 异常: %s" % (attempt, e))
-        time.sleep(2 * (attempt + 1))
+        time.sleep(3 * (attempt + 1))
     return None
 
 
@@ -333,7 +334,13 @@ def generate_images(episode: Dict, prompts: List[str], ep_dir: str) -> List[Opti
         ok = _download(url, dest)
         return idx, dest if ok else None
 
-    with ThreadPoolExecutor(max_workers=cfg.media.image_concurrency) as pool:
+    # 并发自适应：图多时降并发，避免瞬间打爆 RPM 限流（图片>12 张时改串行）
+    base_conc = max(1, int(getattr(cfg.media, "image_concurrency", 4)))
+    conc = 1 if len(prompts) > 12 else base_conc
+    if conc != base_conc:
+        print("    [生图] 图片 %d 张较多，并发降至 %d 防 RPM 限流" % (len(prompts), conc))
+
+    with ThreadPoolExecutor(max_workers=conc) as pool:
         futs = {pool.submit(_one, (i, p)): i for i, p in enumerate(prompts)}
         for fut in as_completed(futs):
             idx, path = fut.result()
@@ -349,7 +356,7 @@ def generate_images(episode: Dict, prompts: List[str], ep_dir: str) -> List[Opti
         if not missing:
             break
         print("    [生图] 补图第%d轮：缺 %d 张，重试" % (retry_round + 1, len(missing)))
-        with ThreadPoolExecutor(max_workers=cfg.media.image_concurrency) as pool:
+        with ThreadPoolExecutor(max_workers=conc) as pool:
             futs = {pool.submit(_one, (i, prompts[i])): i for i in missing}
             for fut in as_completed(futs):
                 idx, path = fut.result()
@@ -412,7 +419,7 @@ def _retry_generate_images(episode: Dict, retry_items: List, ep_dir: str) -> Dic
             return idx, dest
         return idx, None
 
-    with ThreadPoolExecutor(max_workers=cfg.media.image_concurrency) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, min(cfg.media.image_concurrency, 2))) as pool:
         futs = {pool.submit(_one, item): item[0] for item in retry_items}
         for fut in as_completed(futs):
             idx, path = fut.result()
@@ -580,10 +587,15 @@ def generate_tts(tts_meta: List[Dict], ep_dir: str) -> List[Optional[str]]:
         if not text.strip():
             return idx, None
         voice_id = _resolve_voice_id(m.get("voice", ""))
+        speed = float(m.get("speed", 1.08))
+        # 结尾段语气放缓：最后一段旁白放慢（配合视频结尾渐黑，提示即将结束）
+        if idx == len(tts_meta) - 1 and len(tts_meta) > 1:
+            factor = getattr(cfg.media, "ending_speed_factor", 0.85)
+            speed = speed * factor
         audio = _call_tts_api(
             text, voice_id,
             m.get("emotion", "neutral"),
-            float(m.get("speed", 1.08)),
+            speed,
         )
         if not audio:
             return idx, None
@@ -891,6 +903,115 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
     return None
 
 
+def _fill_missing_segment_images(episode: Dict, prompts: List, tts_meta: List,
+                                 ep_dir: str) -> List:
+    """自动为无图的 TTS 段补生成图片（质检闭环：检测到缺段→补图）。
+
+    返回补图后的 image_prompts 列表（原列表 + 新增项，已写回 image_prompts.json）。
+    若某段无图，用 LLM 根据该段 TTS 文本 + 本集人物档案生成一个生图 prompt，
+    再调生图接口落盘 images/NNN.png，并追加 narration_segment 指向该段。
+    """
+    if not prompts or not tts_meta:
+        return prompts
+    # 找出已覆盖的段
+    covered = set()
+    for p in prompts:
+        if isinstance(p, dict):
+            try:
+                ns = int(p.get("narration_segment")) if p.get("narration_segment") is not None else None
+                if ns is not None:
+                    covered.add(ns)
+            except (ValueError, TypeError):
+                pass
+    missing = [s for s in range(1, len(tts_meta) + 1) if s not in covered]
+    if not missing:
+        return prompts
+
+    print("    [补图] 检测到 %d 个 TTS 段无图: %s" % (len(missing), missing))
+    # 收集人物档案（与 material_generator 一致）
+    char_profiles = []
+    try:
+        from agents.memory_manager import get_memory_agent
+        char_ids = set()
+        for s in episode.get("scenes", []):
+            for c in s.get("characters", []):
+                if isinstance(c, dict):
+                    cid = c.get("char_id") or c.get("name")
+                    if cid:
+                        char_ids.add(cid)
+        mem = get_memory_agent()
+        char_profiles = [c for c in mem.get_character_profiles() if c.get("char_id") in char_ids]
+    except Exception as e:
+        print("    [补图] 人物档案获取失败(继续): %s" % e)
+
+    # 用 LLM 为每个缺失段生成生图 prompt
+    try:
+        from llm_factory import get_llm
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from prompts import load_prompt
+        art_style = getattr(get_config().media, "art_style", "anime")
+        sys_prompt = load_prompt("material_generator", art_style=art_style)
+        llm = get_llm(role="production")
+        # 参考已有 prompt 的风格（取第一张图的 prompt 前 200 字作风格锚）
+        style_anchor = ""
+        for p in prompts:
+            if isinstance(p, dict) and p.get("prompt"):
+                style_anchor = p["prompt"][:200]
+                break
+    except Exception as e:
+        print("    [补图] LLM 初始化失败: %s" % e)
+        return prompts
+
+    new_items = []
+    for seg_no in missing:
+        seg_text = (tts_meta[seg_no - 1].get("text") or "").strip()
+        if not seg_text:
+            continue
+        user_msg = f"""本集剧情：{episode.get('summary','')}
+
+该段旁白（必须据此生成画面）：{seg_text}
+
+【人物设定档案】
+{json.dumps(char_profiles, ensure_ascii=False, indent=2) if char_profiles else '（无档案）'}
+
+【参考已有生图 prompt 风格】
+{style_anchor}
+
+请只生成 1 张生图 prompt（JSON 格式：{{"prompt": "..."}}），描述该段最核心的一个画面。
+要求：与参考风格一致；人物外貌严格沿用档案；包含动作/场景/情绪；不输出思考过程，直接输出 JSON。"""
+        try:
+            resp = llm.invoke([SystemMessage(content=sys_prompt),
+                               HumanMessage(content=user_msg)])
+            from utils import extract_json_dict
+            data = extract_json_dict(resp.content) or {}
+            new_prompt = (data.get("prompt") or "").strip()
+            if not new_prompt:
+                new_prompt = seg_text[:200]
+            print("    [补图] 段%02d prompt 生成: %s..." % (seg_no, new_prompt[:60]))
+            new_items.append({"index": len(prompts) + len(new_items) + 1,
+                              "narration_segment": seg_no, "start_ratio": 0.0,
+                              "characters": [], "prompt": new_prompt, "mood": ""})
+        except Exception as e:
+            print("    [补图] 段%02d prompt 生成失败: %s" % (seg_no, e))
+
+    if not new_items:
+        print("    [补图] 未能生成任何补图 prompt")
+        return prompts
+
+    # 追加到 prompts 并写回
+    prompts = list(prompts) + new_items
+    with open(os.path.join(ep_dir, "image_prompts.json"), "w", encoding="utf-8") as f:
+        json.dump(prompts, f, ensure_ascii=False, indent=2)
+
+    # 生图补全（仅对新图）
+    new_paths = _retry_generate_images(episode, [(len(prompts) - len(new_items) + i, p)
+                                                 for i, p in enumerate(new_items)], ep_dir)
+    # 补图成功的写回 images；失败的保留 prompt（合成时该段仍可能无图→再次触发修复）
+    ok_new = sum(1 for _, v in new_paths.items() if v)
+    print("    [补图] 完成: %d/%d 段补图成功" % (ok_new, len(new_items)))
+    return prompts
+
+
 def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[str]],
                   tts_meta: List[Dict], ep_dir: str, eid: str,
                   image_prompts: List = None) -> Optional[str]:
@@ -933,6 +1054,7 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
 
     clips: List[str] = []
     clip_idx = 0
+    total_dur = 0.0  # 累计视频总时长（用于结尾渐黑定位）
     # 遍历每段语音
     for seg_idx in range(len(tts_meta)):
         seg_no = seg_idx + 1  # 1-based
@@ -940,7 +1062,10 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
         # 该段的图片列表（按 start_ratio 排序，确保出现顺序正确）
         imgs = sorted(seg_images.get(seg_no, []), key=lambda x: x["start_ratio"])
         if not imgs:
-            imgs = [{"path": None, "start_ratio": 0.0}]
+            # 该段无图：说明 image_prompts 覆盖不完整，直接中断合成并报告，
+            # 由上层（media_synthesizer_node）触发补图重生成，绝不用灰屏/复用假图兜底。
+            print("    [视频] 段%02d 无图，中断合成，等待补图" % seg_no)
+            return None
         # 音频时长
         if aud and os.path.exists(aud):
             seg_dur = _audio_duration(aud)
@@ -970,6 +1095,7 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
                               pan_direction=pan_dir)
             if clip:
                 clips.append(clip)
+                total_dur += per_img
             clip_idx += 1
 
     if not clips:
@@ -1090,6 +1216,33 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
     except Exception:
         pass
 
+    # 结尾渐黑：最后 N 秒画面+声音一起淡出，提示视频即将结束
+    fade_secs = getattr(cfg.media, "ending_fade_seconds", 3.0)
+    if fade_secs > 0 and total_dur > fade_secs + 0.5 and os.path.exists(out):
+        fade_start = max(0.0, total_dur - fade_secs)
+        fade_tmp = os.path.join(ep_dir, "%s.fade_tmp.mp4" % eid)
+        try:
+            subprocess.run(
+                [exe, "-y", "-i", out,
+                 "-vf", "fade=t=out:st=%.2f:d=%.2f" % (fade_start, fade_secs),
+                 "-af", "afade=t=out:st=%.2f:d=%.2f" % (fade_start, fade_secs),
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0", "-c:a", "aac",
+                 "-r", str(cfg.media.video_fps), fade_tmp],
+                capture_output=True, timeout=600,
+            )
+            if os.path.exists(fade_tmp) and os.path.getsize(fade_tmp) > 1000:
+                os.replace(fade_tmp, out)
+                print("    [视频] 结尾 %d 秒渐黑完成" % fade_secs)
+            else:
+                print("    [视频] 结尾渐黑失败，保留原视频")
+                if os.path.exists(fade_tmp):
+                    try:
+                        os.remove(fade_tmp)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print("    [视频] 结尾渐黑异常(%s)，保留原视频" % e)
+
     if os.path.exists(out) and os.path.getsize(out) > 1000:
         return out
     return None
@@ -1187,9 +1340,40 @@ def media_synthesizer_node(state: Dict, ep_id_override: str = None) -> Dict:
         print("[合成] %s 完成: %s (%.1f MB)" % (eid, video_path, sz_mb))
         # 黑屏检测：扫描视频找黑屏帧，统计黑屏占比
         black_pct = _detect_black_frames(video_path)
+        # 灰屏检测：无图段占位(0x404050) blackdetect 检不出，单独抽帧查暗/灰屏
+        dark_pct = _detect_dark_frames(video_path)
+        if dark_pct > 8.0:
+            print("    [灰屏] %.1f%% 帧为暗/灰屏（存在无图段），自动补图 + 重合成" % dark_pct)
+            try:
+                # 质检闭环：先为无图段补生成图片，再重新合成
+                prompts2 = _fill_missing_segment_images(episode, prompts, tts_meta, ep_dir)
+                if len(prompts2) > len(prompts):
+                    # 重新收集图片路径（含新增图）
+                    image_paths2 = _list_image_paths(ep_dir, len(prompts2))
+                    # 补图成功的新图已在 images/ 落盘，直接重合成
+                    video_path2 = compose_video(image_paths2, audio_paths, tts_meta,
+                                                ep_dir, eid, image_prompts=prompts2)
+                else:
+                    video_path2 = None
+                if video_path2:
+                    video_path = video_path2
+                    dark_pct2 = _detect_dark_frames(video_path)
+                    sz_mb = os.path.getsize(video_path) / (1024 * 1024)
+                    print("[合成] %s 灰屏修复后: %s (%.1f MB) 暗帧 %.1f%%→%.1f%%"
+                          % (eid, video_path, sz_mb, dark_pct, dark_pct2))
+            except Exception as e:
+                print("    [灰屏修复] 重合成异常(%s)，沿用首次视频" % e)
         if black_pct > 5.0:
             # 黑屏超 5%：找出缺失图，重试生图后重新合成
             print("    [黑屏] %.1f%% 帧为黑/暗屏，自动重试缺图 + 重合成" % black_pct)
+            # 先补缺段图（质检闭环：某段无图也会导致黑屏/灰屏）
+            try:
+                prompts_b = _fill_missing_segment_images(episode, prompts, tts_meta, ep_dir)
+                if len(prompts_b) > len(prompts):
+                    prompts = prompts_b
+                    image_paths = _list_image_paths(ep_dir, len(prompts_b))
+            except Exception as e:
+                print("    [黑屏修复] 补缺段图异常: %s" % e)
             still_missing_idx = [i for i, p in enumerate(image_paths)
                                  if not p or (p and not os.path.exists(p))]
             # 也找出用占位图（灰色 0x404050）的项重试
@@ -1231,17 +1415,29 @@ def media_synthesizer_node(state: Dict, ep_id_override: str = None) -> Dict:
                         print("    [黑屏修复] 重合成异常(%s)，沿用首次视频" % e)
         elif black_pct > 0:
             print("    [黑屏] 检测到 %.1f%% 暗帧（可接受范围）" % black_pct)
+
+        # ── 最终质检：黑/灰屏修复后再次检测，不达标则标记失败（不允许通过） ──
+        final_black = _detect_black_frames(video_path)
+        final_dark = _detect_dark_frames(video_path)
+        quality_ok = (final_black <= 5.0 and final_dark <= 8.0)
+        if quality_ok:
+            print("[质检] %s 通过：黑屏 %.1f%% 灰屏 %.1f%%" % (eid, final_black, final_dark))
+        else:
+            print("[质检] %s 不通过：黑屏 %.1f%% 灰屏 %.1f%%（将触发整集重生成）"
+                  % (eid, final_black, final_dark))
     else:
         print("[合成] %s 视频未生成（图片/音频已落盘）" % eid)
+        quality_ok = False
+        final_black = final_dark = 0.0
 
     # 集间间隔：让生图 API 的 RPM 限流配额恢复，避免下一集开头连续 429/1002 限流。
     # 用户反馈"第一集快第二集慢"即源于此。间隔只在实际还有下一集时生效（由 target 控制）。
     inter_episode_pause = int(getattr(cfg.media, "inter_episode_pause", 45))
-    if inter_episode_pause > 0 and video_path:
+    if inter_episode_pause > 0 and video_path and quality_ok:
         print("[间隔] 等待 %d 秒让生图 API 限流配额恢复再继续下一集..." % inter_episode_pause)
         time.sleep(inter_episode_pause)
 
-    return {"video_path": video_path}
+    return {"video_path": video_path, "video_quality_ok": quality_ok}
 
 
 def _detect_black_frames(video_path: str, threshold: float = 0.07) -> float:
@@ -1283,6 +1479,67 @@ def _detect_black_frames(video_path: str, threshold: float = 0.07) -> float:
         return black_total / total * 100.0
     except Exception as e:
         print("    [黑屏] 检测失败: %s" % e)
+        return 0.0
+
+
+def _detect_dark_frames(video_path: str, n_samples: int = 40) -> float:
+    """抽帧采样检测"整体暗/灰屏"（如 0x404050 占位灰屏）占比%。
+
+    blackdetect 的 pix_th 只认纯黑（<25/255），灰色占位(64/255≈0.25)检不出。
+    这里每隔 n_samples 等分抽一帧，统计整帧平均亮度 < 80/255（灰屏量级）的比例。
+    返回暗/灰帧占比%（0-100）。
+    """
+    try:
+        exe = _ffmpeg_path()
+        total = 0.0
+        r = subprocess.run([exe, "-i", video_path], capture_output=True, text=True, timeout=30)
+        for line in (r.stderr or "").splitlines():
+            if "Duration:" in line:
+                seg = line.split("Duration:")[1].split(",")[0].strip()
+                h, m, s = seg.split(":")
+                total = int(h) * 3600 + int(m) * 60 + float(s)
+                break
+        if total <= 0:
+            return 0.0
+        # 抽帧到原始像素，用 ffmpeg signalstats 取平均亮度（每帧 YAVG）
+        # 用 -vf "signalstats,metadata=print" 逐帧输出 YAVG 太慢；改抽帧 + PIL 计算
+        import tempfile
+        import numpy as np
+        from PIL import Image
+        dark = 0
+        checked = 0
+        # 均匀采样 n_samples 个时间点（避开首尾 1s 渐变）
+        step = max(1.0, total / n_samples)
+        ts = 1.0
+        while ts < total - 1.0:
+            tmp = os.path.join(tempfile.gettempdir(), "_dark_%d_%d.png" % (os.getpid(), int(ts * 100)))
+            subprocess.run(
+                [exe, "-ss", "%.2f" % ts, "-i", video_path, "-frames:v", "1", "-y", tmp],
+                capture_output=True, timeout=30,
+            )
+            if os.path.exists(tmp):
+                try:
+                    arr = np.array(Image.open(tmp).convert("RGB"))
+                    mean = arr.mean()
+                    std = arr.std()
+                    checked += 1
+                    # 灰屏占位特征：整帧均匀灰蓝色(0x404050≈(63,62,79))，亮度低且几乎无变化
+                    # 纯暗色剧情画面（如黑夜大殿）虽然亮度低但有内容/明暗变化(std 大)，不算灰屏
+                    if mean < 80 and std < 8:
+                        dark += 1
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+            ts += step
+        if checked == 0:
+            return 0.0
+        return dark / checked * 100.0
+    except Exception as e:
+        print("    [灰屏] 检测失败: %s" % e)
         return 0.0
 
 

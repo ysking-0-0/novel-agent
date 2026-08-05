@@ -16,6 +16,7 @@ from config import get_config
 REQUIRED_EPISODE_FIELDS = ["scenes", "summary", "cliffhanger"]
 REQUIRED_SCENE_FIELDS = ["scene_id", "summary", "cause", "motivation", "core_action", "immediate_result", "long_term_impact", "characters", "foreshadows"]
 REQUIRED_TTS_FIELDS = ["index", "text", "voice", "emotion", "speed", "pause_after"]
+MAX_IMAGE_PROMPTS = 35  # 图片数量硬性上限，防 LLM 输出超长被截断
 
 
 def format_validator_node(state: Dict) -> Dict:
@@ -47,6 +48,8 @@ def format_validator_node(state: Dict) -> Dict:
     # 4. image_prompts 非空列表（支持 List[str] 或 List[dict]）
     if not isinstance(image_prompts, list) or len(image_prompts) == 0:
         errors.append("episode_image_prompts 为空")
+    elif len(image_prompts) > MAX_IMAGE_PROMPTS:
+        errors.append(f"episode_image_prompts 数量超限({len(image_prompts)}>{MAX_IMAGE_PROMPTS})")
     else:
         for i, p in enumerate(image_prompts):
             if isinstance(p, dict):
@@ -63,6 +66,23 @@ def format_validator_node(state: Dict) -> Dict:
             for f in REQUIRED_TTS_FIELDS:
                 if f not in t:
                     errors.append(f"tts_meta[{i}] 缺失字段: {f}")
+
+    # 6. image_prompts 的 narration_segment 必须覆盖所有 tts_meta 段（每段至少1张图）
+    #    缺任何一段 → 该段在视频合成时会黑屏/灰屏，必须拦截重生成
+    if isinstance(image_prompts, list) and image_prompts and isinstance(tts_meta, list) and tts_meta:
+        covered_segs = set()
+        for i, p in enumerate(image_prompts):
+            if isinstance(p, dict):
+                ns = p.get("narration_segment")
+                try:
+                    ns = int(ns) if ns is not None else None
+                except (ValueError, TypeError):
+                    ns = None
+                if ns is not None:
+                    covered_segs.add(ns)
+        for seg_no in range(1, len(tts_meta) + 1):
+            if seg_no not in covered_segs:
+                errors.append(f"TTS段{seg_no} 无对应图片(narration_segment 未覆盖该段)")
 
     valid = len(errors) == 0
     retry = state.get("retry_count", 0)

@@ -69,9 +69,19 @@ class MaterialGeneratorAgent:
 
     def invoke(self, state: Dict) -> Dict:
         """LangGraph 节点入口。"""
+        revise = (state.get("review_result") or {}).get("unified_revise_instruction")
+        # 格式校验失败也要反馈给 LLM，否则重试是盲目的（会重复同样的错误）
+        format_errors = state.get("format_errors") or []
+        if format_errors:
+            err_instr = {"format_errors": format_errors,
+                         "message": "上一轮素材未通过格式校验，必须按下述错误逐条修正后重新生成完整 JSON。特别注意：图片数量严禁超过 35 张；image_prompts/tts_meta 严禁为空。"}
+            if isinstance(revise, dict):
+                revise = {**revise, "format_errors": format_errors}
+            else:
+                revise = err_instr
         result = self.generate(
             state.get("current_episode") or {},
-            (state.get("review_result") or {}).get("unified_revise_instruction"),
+            revise,
         )
         return {
             "episode_script": result.get("script", ""),
