@@ -125,8 +125,8 @@ class MediaConfig:
     enable_synthesis: bool = (
         os.getenv("ENABLE_SYNTHESIS", "true").lower() == "true"
     )
-    # 生图并发数（RPM 限流敏感：默认 2 保守，图多时 media_synthesizer 自动降为 1 串行）
-    image_concurrency: int = int(os.getenv("IMAGE_CONCURRENCY", "2"))
+    # 生图并发数（官方 RPM=10、无并发上限，media_synthesizer 有全局 RPM 限速器兜底，3 并发安全）
+    image_concurrency: int = int(os.getenv("IMAGE_CONCURRENCY", "3"))
     # TTS 并发数（speech-02-hd 单次约 1.4s，4 并发安全）
     tts_concurrency: int = int(os.getenv("TTS_CONCURRENCY", "4"))
     # 生图模型
@@ -150,10 +150,8 @@ class MediaConfig:
     bgm_volume: float = float(os.getenv("BGM_VOLUME", "0.25"))
     # TTS 音量增益（1.0=原始，>1放大）。合成时对 TTS 音轨统一施加该增益
     tts_volume: float = float(os.getenv("TTS_VOLUME", "1.25"))
-    # 结尾渐黑秒数（0=关闭）：视频最后 N 秒画面+声音一起淡出，提示即将结束
-    ending_fade_seconds: float = float(os.getenv("ENDING_FADE_SECONDS", "3.0"))
-    # 结尾段 TTS 语速系数（<1 放慢）：最后一段旁白放缓语气，配合结尾渐黑
-    ending_speed_factor: float = float(os.getenv("ENDING_SPEED_FACTOR", "0.85"))
+    # 结尾延长秒数（0=关闭）：最后一张图定格 N 秒、讲解声停止、BGM 慢慢淡出（保留底音）
+    ending_extend_seconds: float = float(os.getenv("ENDING_EXTEND_SECONDS", "3.0"))
     # 是否在视频上烧录字幕（从 tts_meta 文本生成 SRT，drawtext 渲染）
     enable_subtitles: bool = os.getenv("ENABLE_SUBTITLES", "false").lower() == "true"
     # 字幕字体大小（像素，相对于 1080p 高度）

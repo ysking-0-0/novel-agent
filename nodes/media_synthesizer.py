@@ -58,6 +58,29 @@ def _get_session() -> requests.Session:
     return s
 
 
+# ────────────── 生图 RPM 限速器（MiniMax image-01 官方限流 RPM=10） ──────────────
+# 滑动窗口限速：全局限定最多 IMAGE_RPM_LIMIT 次请求/分钟，所有生图请求（正片/定妆照/补图）共享。
+# 官方没有 CONN 并发上限，真正的瓶颈是每分钟 10 次请求。与其"图多就降并发"一刀切串行
+# （16 张图只用到 ~3 RPM，浪费 70% 额度），不如保持并发，由限速器精确卡在 9 RPM（留 1 余量），
+# 既不触发 1002 限流，又把生图吞吐压到官方上限。
+_image_rpm_lock = threading.Lock()
+_image_rpm_times: List[float] = []
+IMAGE_RPM_LIMIT = 9  # 官方 10 RPM，留 1 余量防瞬时抖动
+
+
+def _acquire_image_slot():
+    """阻塞直到获得一个生图请求配额（保证 ≤ IMAGE_RPM_LIMIT 次/分钟）。"""
+    global _image_rpm_times
+    while True:
+        with _image_rpm_lock:
+            now = time.time()
+            _image_rpm_times = [t for t in _image_rpm_times if now - t < 60.0]
+            if len(_image_rpm_times) < IMAGE_RPM_LIMIT:
+                _image_rpm_times.append(now)
+                return
+        time.sleep(0.5)
+
+
 def _headers() -> dict:
     return {
         "Authorization": "Bearer " + get_config().model.api_key,
@@ -106,6 +129,8 @@ def _enhance_prompt_with_style(prompt: str) -> str:
 def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None) -> Optional[str]:
     """调用 MiniMax 生图接口，返回图片 URL 或 None。"""
     cfg = get_config()
+    # 先获取 RPM 配额（阻塞等待），保证全局 ≤ 9 次/分钟，从源头避免 1002 限流
+    _acquire_image_slot()
     enhanced_prompt = _enhance_prompt_with_style(prompt)
     payload = {
         "model": cfg.media.image_model,
@@ -334,11 +359,11 @@ def generate_images(episode: Dict, prompts: List[str], ep_dir: str) -> List[Opti
         ok = _download(url, dest)
         return idx, dest if ok else None
 
-    # 并发自适应：图多时降并发，避免瞬间打爆 RPM 限流（图片>12 张时改串行）
-    base_conc = max(1, int(getattr(cfg.media, "image_concurrency", 4)))
-    conc = 1 if len(prompts) > 12 else base_conc
-    if conc != base_conc:
-        print("    [生图] 图片 %d 张较多，并发降至 %d 防 RPM 限流" % (len(prompts), conc))
+    # 并发：由全局 RPM 限速器兜底（官方 image-01 RPM=10，无 CONN 上限），
+    # 不再因图多一刀切降并发——限速器会精确卡在 9 RPM，既安全又把吞吐用满。
+    base_conc = max(1, int(getattr(cfg.media, "image_concurrency", 3)))
+    conc = base_conc
+    print("    [生图] 并发 %d（限速器 %d RPM 兜底），共 %d 张" % (conc, IMAGE_RPM_LIMIT, len(prompts)))
 
     with ThreadPoolExecutor(max_workers=conc) as pool:
         futs = {pool.submit(_one, (i, p)): i for i, p in enumerate(prompts)}
@@ -419,7 +444,7 @@ def _retry_generate_images(episode: Dict, retry_items: List, ep_dir: str) -> Dic
             return idx, dest
         return idx, None
 
-    with ThreadPoolExecutor(max_workers=max(1, min(cfg.media.image_concurrency, 2))) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, int(getattr(cfg.media, "image_concurrency", 3)))) as pool:
         futs = {pool.submit(_one, item): item[0] for item in retry_items}
         for fut in as_completed(futs):
             idx, path = fut.result()
@@ -588,10 +613,6 @@ def generate_tts(tts_meta: List[Dict], ep_dir: str) -> List[Optional[str]]:
             return idx, None
         voice_id = _resolve_voice_id(m.get("voice", ""))
         speed = float(m.get("speed", 1.08))
-        # 结尾段语气放缓：最后一段旁白放慢（配合视频结尾渐黑，提示即将结束）
-        if idx == len(tts_meta) - 1 and len(tts_meta) > 1:
-            factor = getattr(cfg.media, "ending_speed_factor", 0.85)
-            speed = speed * factor
         audio = _call_tts_api(
             text, voice_id,
             m.get("emotion", "neutral"),
@@ -810,7 +831,7 @@ def generate_srt(tts_meta: List[Dict], audio_paths: List[Optional[str]],
 def _make_clip(image_path: Optional[str], audio_path: Optional[str],
                idx: int, tmp_dir: str, resolution: str, fps: int,
                duration: float = None, audio_seek: float = 0,
-               pan_direction: str = "down") -> Optional[str]:
+               pan_direction: str = "down", video_extend: float = 0.0) -> Optional[str]:
     """单张图片 + 音频片段合成片段 mp4，带 Ken Burns 垂直平移动效。
 
     动效（85%/15%设计）：图片先放大到 W x (H/0.85)≈H*1.176，
@@ -820,6 +841,8 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
 
     duration: 指定片段时长（用于同段音频内多图切片）。
     audio_seek: 音频起始偏移（秒），用于同段音频内多图切片。
+    video_extend: 视频额外延长秒数（音频仍在 duration 处截断→讲解停止，
+                  画面+动效延续到 duration+video_extend，用于结尾画面定格延续）。
     """
     exe = _ffmpeg_path()
     out = os.path.join(tmp_dir, "clip_%03d.mp4" % idx)
@@ -840,22 +863,20 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
             )
         img_arg = ["-loop", "1", "-framerate", str(fps), "-i", placeholder]
 
-    # 音频输入与时长
+    # 音频输入与时长（有 duration 时用输入 -t 截断音频，视频用输出 -t vdur 可延长）
     if audio_path and os.path.exists(audio_path):
-        # 支持 seek 偏移（同段音频多图切片）
         seek_arg = ["-ss", "%.2f" % audio_seek] if audio_seek > 0 else []
-        aud_arg = seek_arg + ["-i", audio_path]
         if duration is not None:
             dur = duration
-            extra = ["-t", "%.2f" % dur]
+            aud_arg = seek_arg + ["-t", "%.2f" % dur, "-i", audio_path]
         else:
             dur = _audio_duration(audio_path)
-            extra = ["-shortest"]
+            aud_arg = seek_arg + ["-i", audio_path]
     else:
         aud_arg = ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=24000"]
         dur = duration if duration is not None else 3.0
-        extra = ["-t", "%.2f" % dur]
 
+    vdur = dur + max(0.0, video_extend)
     w, h = resolution.split("x")
     W = int(w)
     H = int(h)
@@ -871,7 +892,7 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
     img_h_up = int(H * ZOOM_RATIO * SUBPIXEL)   # 放大域图片高
     win_h_up = H * SUBPIXEL                      # 放大域窗口高
     pan_total_up = img_h_up - win_h_up           # 放大域滑动总位移
-    safe_dur = max(0.1, dur)
+    safe_dur = max(0.1, vdur)
     if pan_direction == "up":
         # 窗口从底部滑到顶部（图片从下往上展开）
         # 用 clamp(.,0,pan_total) 防止 t 超出 safe_dur 时 y 越界导致纯色填充
@@ -892,8 +913,9 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
         "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-bf", "0",                    # 禁用B帧，避免预测帧复用导致画面卡顿
         "-r", str(fps),                # 输出帧率
-        "-c:a", "aac", "-b:a", "128k", "-t", "%.2f" % dur,
-    ] + extra + [out]
+        "-c:a", "aac", "-b:a", "128k",
+        "-t", "%.2f" % vdur,
+    ] + [out]
     try:
         subprocess.run(cmd, capture_output=True, timeout=120)
         if os.path.exists(out) and os.path.getsize(out) > 1000:
@@ -1054,7 +1076,8 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
 
     clips: List[str] = []
     clip_idx = 0
-    total_dur = 0.0  # 累计视频总时长（用于结尾渐黑定位）
+    total_dur = 0.0  # 累计视频总时长（用于结尾延长/淡出定位）
+    last_img_path = None  # 最后一张有效图片（结尾延长用）
     # 遍历每段语音
     for seg_idx in range(len(tts_meta)):
         seg_no = seg_idx + 1  # 1-based
@@ -1083,19 +1106,29 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
                 if starts[i + 1] <= starts[i]:
                     starts[i] = starts[i + 1] * (i / (len(starts)))
         # 每张图时长 = 下张起点 - 本张起点；末张 = seg_dur - 本张起点
+        extend_secs = float(getattr(cfg.media, "ending_extend_seconds", 0.0))
         for i, img in enumerate(imgs):
             t_start = starts[i]
             t_end = starts[i + 1] if i + 1 < len(imgs) else seg_dur
             per_img = max(0.3, t_end - t_start)  # 最小0.3s
             # 平移方向交替：偶数 idx 从上往下，奇数从下往上
             pan_dir = "down" if clip_idx % 2 == 0 else "up"
+            # 结尾延长：全局最后一张图（最后一段的最后一张）视频延长 extend 秒，
+            # 动效在同一 clip 内自然延续（不新建 clip，避免画面跳动），
+            # 音频仍在 per_img 处截断（讲解声停止），BGM 淡出在混入阶段处理。
+            is_last_img = (seg_idx == len(tts_meta) - 1) and (i == len(imgs) - 1)
+            vext = extend_secs if is_last_img and extend_secs > 0 else 0.0
             clip = _make_clip(img["path"], aud, clip_idx, tmp_dir,
                               cfg.media.video_resolution, cfg.media.video_fps,
                               duration=per_img, audio_seek=t_start,
-                              pan_direction=pan_dir)
+                              pan_direction=pan_dir, video_extend=vext)
             if clip:
                 clips.append(clip)
-                total_dur += per_img
+                total_dur += per_img + vext
+                if vext > 0:
+                    print("    [视频] 结尾最后一张图延长 %.1f 秒（动效延续、讲解停止）" % vext)
+                if os.path.exists(img["path"]):
+                    last_img_path = img["path"]
             clip_idx += 1
 
     if not clips:
@@ -1150,9 +1183,29 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
             sub_filter, sub_pngs = result
             print("    [字幕] 生成 %d 张 PNG" % len(sub_pngs))
 
+    # BGM 淡出：结尾延长段（最后 extend_secs 秒）BGM 线性降低，保留 10% 底音（不完全消失）
+    bgm_fade = ""
+    if extend_secs > 0 and total_dur > extend_secs + 0.5:
+        fade_start = total_dur - extend_secs
+        bv = cfg.media.bgm_volume
+        # volume 表达式：t<fade_start 保持 bv；之后线性降到 bv*0.1（约 -20dB 底音）
+        bgm_fade = (",volume='max(%.4f, %.3f*(1-max(0,t-%.2f)/%.2f))':eval=frame"
+                    % (bv * 0.1, bv, fade_start, extend_secs))
+        print("    [视频] BGM 结尾 %.1f 秒淡出（保留 %.0f%% 底音）" % (extend_secs, 10))
+    # BGM 淡出：结尾延长段（最后 extend_secs 秒）BGM 线性降低，保留 10% 底音（不完全消失）
+    bgm_fade = ""
+    if extend_secs > 0 and total_dur > extend_secs + 0.5:
+        fade_start = total_dur - extend_secs
+        bv = cfg.media.bgm_volume
+        # volume 表达式：t<fade_start 保持 bv；之后线性降到 bv*0.1（约 -20dB 底音）
+        bgm_fade = (",volume='max(%.4f, %.3f*(1-max(0,t-%.2f)/%.2f))':eval=frame"
+                    % (bv * 0.1, bv, fade_start, extend_secs))
+        print("    [视频] BGM 结尾 %.1f 秒淡出（保留 %.0f%% 底音）" % (extend_secs, 10))
+    # amix 用 duration=longest：BGM 播放到延长段（视频比 TTS 长 extend 秒），
+    # BGM 输入用 -t total_dur 限制循环时长，配合 -shortest 对齐视频总时长。
     amix_audio = (
-        "[0:a]volume=%.2f[tts];[1:a]volume=%.2f[bg];[tts][bg]amix=inputs=2:duration=first:dropout_transition=0[a]"
-        % (tts_gain, cfg.media.bgm_volume)
+        "[0:a]volume=%.2f[tts];[1:a]volume=%.2f%s[bg];[tts][bg]amix=inputs=2:duration=longest:dropout_transition=0[a]"
+        % (tts_gain, cfg.media.bgm_volume, bgm_fade)
     )
     if bgm and os.path.exists(bgm):
         # 有 BGM：filter_complex 同时做音频混音 + 视频字幕overlay
@@ -1164,10 +1217,10 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
         else:
             fc = amix_audio
             vmap = "0:v"
+        bgm_args = ["-stream_loop", "-1", "-t", "%.2f" % total_dur, "-i", bgm]
         try:
             subprocess.run(
-                [exe, "-y", "-i", concat_out,
-                 "-stream_loop", "-1", "-i", bgm] + sub_inputs +
+                [exe, "-y", "-i", concat_out] + bgm_args + sub_inputs +
                 ["-filter_complex", fc,
                  "-map", vmap, "-map", "[a]",
                  "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0", "-c:a", "aac",
@@ -1177,8 +1230,7 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
             if not (os.path.exists(out) and os.path.getsize(out) > 1000):
                 print("    [视频] BGM+字幕 混入首次失败，重试")
                 subprocess.run(
-                    [exe, "-y", "-i", concat_out,
-                     "-stream_loop", "-1", "-i", bgm] + sub_inputs +
+                    [exe, "-y", "-i", concat_out] + bgm_args + sub_inputs +
                     ["-filter_complex", fc,
                      "-map", vmap, "-map", "[a]",
                      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0", "-c:a", "aac",
@@ -1215,33 +1267,6 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
         shutil.rmtree(tmp_dir)
     except Exception:
         pass
-
-    # 结尾渐黑：最后 N 秒画面+声音一起淡出，提示视频即将结束
-    fade_secs = getattr(cfg.media, "ending_fade_seconds", 3.0)
-    if fade_secs > 0 and total_dur > fade_secs + 0.5 and os.path.exists(out):
-        fade_start = max(0.0, total_dur - fade_secs)
-        fade_tmp = os.path.join(ep_dir, "%s.fade_tmp.mp4" % eid)
-        try:
-            subprocess.run(
-                [exe, "-y", "-i", out,
-                 "-vf", "fade=t=out:st=%.2f:d=%.2f" % (fade_start, fade_secs),
-                 "-af", "afade=t=out:st=%.2f:d=%.2f" % (fade_start, fade_secs),
-                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-bf", "0", "-c:a", "aac",
-                 "-r", str(cfg.media.video_fps), fade_tmp],
-                capture_output=True, timeout=600,
-            )
-            if os.path.exists(fade_tmp) and os.path.getsize(fade_tmp) > 1000:
-                os.replace(fade_tmp, out)
-                print("    [视频] 结尾 %d 秒渐黑完成" % fade_secs)
-            else:
-                print("    [视频] 结尾渐黑失败，保留原视频")
-                if os.path.exists(fade_tmp):
-                    try:
-                        os.remove(fade_tmp)
-                    except Exception:
-                        pass
-        except Exception as e:
-            print("    [视频] 结尾渐黑异常(%s)，保留原视频" % e)
 
     if os.path.exists(out) and os.path.getsize(out) > 1000:
         return out
