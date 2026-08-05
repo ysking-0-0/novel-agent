@@ -64,8 +64,31 @@ class MaterialGeneratorAgent:
             SystemMessage(content=system_prompt),
             HumanMessage(content=self._build_user_msg(episode, char_profiles, revise_instruction)),
         ]
-        resp = self.llm.invoke(messages)
-        return self._parse(resp.content)
+        # LLM 偶发失败/输出截断会返回空素材 → 空集归档。
+        # 内部自动重试最多 3 次，并打印诊断信息；全部失败才返回空（由 persistence 防归档拦截）。
+        import time
+        last_content = ""
+        for attempt in range(3):
+            try:
+                resp = self.llm.invoke(messages)
+                content = resp.content
+                last_content = content
+                parsed = self._parse(content)
+                if isinstance(parsed, dict) and not parsed.get("_parse_error") \
+                        and parsed.get("image_prompts") and parsed.get("tts_meta"):
+                    return parsed
+                # 解析成功但关键字段为空（LLM 输出被截断/格式错）：打印诊断后重试
+                content_str = str(content)
+                print("    [素材生成] LLM 输出解析失败或为空 (attempt %d/3)，长度=%d，前200字: %s"
+                      % (attempt + 1, len(content_str), content_str[:200].replace("\n", " ")))
+            except Exception as e:
+                print("    [素材生成] LLM 调用异常 (attempt %d/3): %s" % (attempt + 1, e))
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+        # 三次都失败：返回最后一次解析结果（可能为空，由上层格式校验+空集防护兜底）
+        return self._parse(last_content) if last_content else {
+            "script": "", "image_prompts": [], "tts_meta": [], "_parse_error": True,
+        }
 
     def invoke(self, state: Dict) -> Dict:
         """LangGraph 节点入口。"""

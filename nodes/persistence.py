@@ -39,6 +39,18 @@ def persistence_node(state: Dict) -> Dict:
     out_dir = cfg.storage.output_dir
     _ensure_dir(out_dir)
 
+    # ── 空集防护：素材全空（0图0段无文案）绝不归档 ──
+    # LLM 连续失败且重试耗尽时，material_generator 可能返回空。此时归档 = 假进度，
+    # 媒体合成阶段会因无图直接失败或产出空视频。宁可中断报错，也不写空集目录。
+    imgs = state.get("episode_image_prompts") or []
+    tts = state.get("episode_tts_meta") or []
+    script = (state.get("episode_script") or "").strip()
+    if not imgs and not tts and not script:
+        raise RuntimeError(
+            "拒绝归档空集：素材生成失败（image_prompts/tts_meta/script 全空）且重试耗尽。"
+            "请检查 LLM 输出后重跑该集。"
+        )
+
     episode = dict(state.get("current_episode") or {})
     # 赋 episode_id（聚合阶段为 None，此处按完成序号赋值 ep_xxx）
     completed = state.get("completed_episode_count", 0) + 1
