@@ -165,8 +165,10 @@ def _resume_state(graph, thread_id: str, target_override: int = None) -> Dict[st
 
 
 def run(novel_path: str, target: int = None, resume: bool = False, config_file: str = None,
-        novel_queue: list = None, book: str = None):
-    """主运行入口。book: 书名，指定后 storage 路径重定向到 novels/<book>/ 下。"""
+        novel_queue: list = None, book: str = None, _param_sync: dict = None):
+    """主运行入口。book: 书名，指定后 storage 路径重定向到 novels/<book>/ 下。
+    _param_sync: 监督循环调参后需同步进断点 state 的字段（如 chunk_size）。
+    """
     if config_file and os.path.exists(config_file):
         set_config(config_file)
 
@@ -230,11 +232,16 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
                 thread_id = _next_resume_thread_id(graph, thread_base)
                 config = {"configurable": {"thread_id": thread_id}}
                 # state 作为全新输入传入（不走 None 恢复）
+                if _param_sync:
+                    state.update(_param_sync)
                 input_state = state
             else:
                 print(f"[续跑] 加载断点状态（已完成{done}集），追加 {target_increment} 集→新目标 {target_override}，offset={state.get('offset',0)}")
                 # 未 END：用 update_state 注入新 target，再 stream(None) 续跑
-                graph.update_state(config, {"target_episode_count": target_override})
+                update_fields = {"target_episode_count": target_override}
+                if _param_sync:
+                    update_fields.update(_param_sync)
+                graph.update_state(config, update_fields)
                 input_state = None
         else:
             print("[续跑] 未找到断点，全新启动")
@@ -312,6 +319,16 @@ def run(novel_path: str, target: int = None, resume: bool = False, config_file: 
         print(f"[运行错误] {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
+        # 抛出带上下文的 PipelineError，由外层监督循环决定自动修复
+        from main_supervisor import PipelineError
+        ctx = {
+            "completed_episode_count": state.get("completed_episode_count"),
+            "target_episode_count": state.get("target_episode_count"),
+            "file_path": state.get("file_path"),
+            "offset": state.get("offset"),
+            "loop_finished": state.get("loop_finished"),
+        }
+        raise PipelineError(str(e), trace=traceback.format_exc(), context=ctx) from e
     finally:
         conn.close()
         print("[完成] 运行结束")
@@ -343,7 +360,10 @@ def main():
     if not args.resume and not args.novel:
         parser.error("全新运行必须提供 --novel 参数")
 
-    run(
+    # 监督循环：出错时自动分析并重试/调参，无需人工介入
+    from main_supervisor import run_with_supervisor
+    run_with_supervisor(
+        run,
         novel_path=args.novel or "",
         target=args.target,
         resume=args.resume,

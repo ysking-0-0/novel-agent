@@ -1058,6 +1058,11 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
     # 每张图收集 (path, narration_segment, start_ratio)
     seg_images: Dict[int, List[Dict]] = {}  # segment(1-based) -> [{path, start_ratio}]
     for i, img_path in enumerate(image_paths):
+        # 防御：image_paths 可能含 None（生图失败且无法占位）。
+        # 直接跳过，避免 os.path.exists(None) 崩溃整集合成。
+        if not img_path or not os.path.exists(img_path):
+            print("    [视频] 跳过缺失图片 idx=%d（生图失败，该图不参与合成）" % i)
+            continue
         narr_seg = None
         sr = 0.0
         if image_prompts and i < len(image_prompts):
@@ -1338,7 +1343,8 @@ def media_synthesizer_node(state: Dict, ep_id_override: str = None) -> Dict:
                 image_paths[i] = path
                 print("    [补图] 第%d张重试成功" % (i + 1))
 
-    # 仍然缺失的图，用前一张成功的图占位（避免纯黑屏）
+    # 仍然缺失的图，用最近一张成功的图占位（避免纯黑屏）。
+    # 前后都找：首图失败时无前图可用，就借后一张成功图。
     last_ok = None
     for i, p in enumerate(image_paths):
         if p and os.path.exists(p):
@@ -1350,6 +1356,22 @@ def media_synthesizer_node(state: Dict, ep_id_override: str = None) -> Dict:
                 _sh.copy(last_ok, placeholder)
                 image_paths[i] = placeholder
                 print("    [补图] 第%d张缺失，用前一张占位" % (i + 1))
+            except Exception:
+                pass
+    # 第一张仍缺失（无前图）：向后找最近成功图占位
+    if image_paths and not (image_paths[0] and os.path.exists(image_paths[0])):
+        next_ok = None
+        for p in image_paths[1:]:
+            if p and os.path.exists(p):
+                next_ok = p
+                break
+        if next_ok:
+            import shutil as _sh
+            placeholder = os.path.join(img_dir, "000.png")
+            try:
+                _sh.copy(next_ok, placeholder)
+                image_paths[0] = placeholder
+                print("    [补图] 第1张缺失，用后一张占位")
             except Exception:
                 pass
     still_missing = sum(1 for p in image_paths if not p)
