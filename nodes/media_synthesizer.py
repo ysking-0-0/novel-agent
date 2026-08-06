@@ -14,6 +14,7 @@ novel_pipeline.nodes.media_synthesizer
 - 定妆照缓存于 memory/character_portraits/<char_id>.jpg，跨集复用
 """
 import os
+import re
 import json
 import base64
 import time
@@ -126,11 +127,53 @@ def _enhance_prompt_with_style(prompt: str) -> str:
     return prompt
 
 
-def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None) -> Optional[str]:
-    """调用 MiniMax 生图接口，返回图片 URL 或 None。"""
+# 敏感内容审核拒绝时，用 LLM 把 prompt 改写为合规表达的最大轮数
+_MAX_SENSITIVE_REWRITE = 3
+
+_REWRITE_PROMPT = """你是图片生成提示词合规改写器。
+下面这条生图 prompt 被内容审核接口拒绝（status_code=1026），需改写为合规版本才能重新生成。
+
+【被拒 prompt】
+{prompt}
+
+【审核信息】
+{msg}
+
+请分析 prompt 中可能导致审核拒绝的元素（暴力、血腥、恐怖、惊悚、性暗示、政治敏感、
+极端意象等），改写为【合规且可生成】的表达，要求：
+1. 保留原场景、构图、人物、氛围的核心意图，不要推翻整个画面
+2. 只软化/替换敏感元素：如"血迹"→"深色纹样"，"尸横遍野"→"肃杀的古战场"，
+   "狰狞"→"严肃"，"断肢"→"破损的铠甲"，"惊恐尖叫"→"紧张的神情"
+3. 保持原有画面描述风格（人物、服饰、动作、光影、背景）
+4. 输出中文，只输出改写后的完整 prompt 本身，不要任何解释或代码块
+"""
+
+
+def _rewrite_prompt_safe(prompt: str, msg: str) -> Optional[str]:
+    """用 LLM 把被内容审核拒绝的 prompt 改写为合规版本。失败返回 None。"""
+    try:
+        from llm_factory import get_llm
+        llm = get_llm(role="support")
+        resp = llm.invoke(_REWRITE_PROMPT.format(prompt=prompt, msg=(msg or "")[:120]))
+        text = getattr(resp, "content", None) or str(resp)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+        text = re.sub(r"^```(?:text|plain)?\s*|\s*```$", "", text).strip()
+        if len(text) < 10:
+            return None
+        return text
+    except Exception as e:
+        print("    [生图] 敏感改写失败: %s" % e)
+        return None
+
+
+def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None,
+                    sensitive_rewrite: bool = True) -> Optional[str]:
+    """调用 MiniMax 生图接口，返回图片 URL 或 None。
+
+    sensitive_rewrite=True 时，1026 内容审核拒绝会用 LLM 改写 prompt 为合规版后重试
+    （最多 _MAX_SENSITIVE_REWRITE 轮），不再静默跳过。1027 用量耗尽无法改写。
+    """
     cfg = get_config()
-    # 先获取 RPM 配额（阻塞等待），保证全局 ≤ 9 次/分钟，从源头避免 1002 限流
-    _acquire_image_slot()
     enhanced_prompt = _enhance_prompt_with_style(prompt)
     payload = {
         "model": cfg.media.image_model,
@@ -140,7 +183,10 @@ def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None) -> O
     if reference_image_b64:
         payload["reference_image"] = reference_image_b64
 
+    rewrite_count = 0
     for attempt in range(6):
+        # 每次真实 API 调用前获取 RPM 配额（改写重试也是一次新请求）
+        _acquire_image_slot()
         try:
             r = _get_session().post(
                 _base_url() + "/image_generation",
@@ -160,10 +206,24 @@ def _call_image_api(prompt: str, reference_image_b64: Optional[str] = None) -> O
                     print("    [生图] 限流(1002 RPM)，等 %ds 重试" % wait)
                     time.sleep(wait)
                     continue
-                # 用量耗尽 / 内容审核敏感：直接放弃不重试
-                if "用量" in msg or status_code in (1026, 1027):
-                    print("    [生图] 跳过(status=%s): %s" % (status_code, msg or "sensitive/quota"))
+                # 用量耗尽(1027)：账户配额问题，改写无用，直接放弃
+                if status_code == 1027 or "用量" in msg:
+                    print("    [生图] 用量耗尽(status=%s)，放弃: %s" % (status_code, msg or "quota"))
                     return None
+                # 内容审核敏感(1026)：用 LLM 改写 prompt 为合规表达后重试，不跳过
+                if status_code == 1026 or "sensitive" in msg.lower() or "审核" in msg:
+                    if not sensitive_rewrite or rewrite_count >= _MAX_SENSITIVE_REWRITE:
+                        print("    [生图] 敏感改写超限(%d轮)，放弃: %s" % (rewrite_count, msg or "sensitive"))
+                        return None
+                    rewrite_count += 1
+                    new_prompt = _rewrite_prompt_safe(payload["prompt"], msg)
+                    if not new_prompt or new_prompt == payload["prompt"]:
+                        print("    [生图] 敏感改写失败，放弃: %s" % (msg or "sensitive"))
+                        return None
+                    print("    [生图] 敏感改写第%d轮 → 重试（合规版 prompt）" % rewrite_count)
+                    payload["prompt"] = new_prompt
+                    continue
+                print("    [生图] 未处理状态码(%s): %s" % (status_code, msg))
         except Exception as e:
             print("    [生图] attempt %d 异常: %s" % (attempt, e))
         time.sleep(3 * (attempt + 1))
