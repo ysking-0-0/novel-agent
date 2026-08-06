@@ -40,8 +40,14 @@ class MaterialGeneratorAgent:
     def __init__(self):
         self.llm = get_llm(role="production")
 
-    def generate(self, episode: Dict, revise_instruction: Optional[Dict] = None) -> Dict:
-        """生成三类素材。返回 dict 含 script / image_prompts / tts_meta。"""
+    def generate(self, episode: Dict, revise_instruction: Optional[Dict] = None,
+                 prev_materials: Optional[Dict] = None) -> Dict:
+        """生成三类素材。返回 dict 含 script / image_prompts / tts_meta。
+
+        revise_instruction: 上一轮评审修改指令。若含 minor_revise 且提供 prev_materials
+          （上一轮已生成的 script/image_prompts/tts_meta），走"局部微调"：把旧素材交给 LLM，
+          只修改被点名的问题项，其余原样保留，避免全量重生成浪费 API。
+        """
         # 每次生成时动态加载 prompt，确保 art_style 切换后立即生效
         # （__init__ 只调一次，若 Agent 被复用，固化 prompt 会导致旧风格残留）
         art_style = getattr(get_config().media, "art_style", "anime")
@@ -62,7 +68,7 @@ class MaterialGeneratorAgent:
 
         messages = [
             SystemMessage(content=system_prompt),
-            HumanMessage(content=self._build_user_msg(episode, char_profiles, revise_instruction)),
+            HumanMessage(content=self._build_user_msg(episode, char_profiles, revise_instruction, prev_materials)),
         ]
         # LLM 偶发失败/输出截断会返回空素材 → 空集归档。
         # 内部自动重试最多 3 次，并打印诊断信息；全部失败才返回空（由 persistence 防归档拦截）。
@@ -92,7 +98,9 @@ class MaterialGeneratorAgent:
 
     def invoke(self, state: Dict) -> Dict:
         """LangGraph 节点入口。"""
-        revise = (state.get("review_result") or {}).get("unified_revise_instruction")
+        rr = state.get("review_result") or {}
+        revise = rr.get("unified_revise_instruction")
+        verdict = rr.get("verdict", "pass")
         # 格式校验失败也要反馈给 LLM，否则重试是盲目的（会重复同样的错误）
         format_errors = state.get("format_errors") or []
         if format_errors:
@@ -102,9 +110,22 @@ class MaterialGeneratorAgent:
                 revise = {**revise, "format_errors": format_errors}
             else:
                 revise = err_instr
+        # 局部微调：仅当仲裁是 minor_revise（轻微瑕疵）且有上一轮素材时，
+        # 把旧素材交给 LLM 只改被点名项；regenerate / 首次生成仍全量重生成。
+        prev_materials = None
+        if verdict == "minor_revise":
+            prev = {
+                "script": state.get("episode_script") or "",
+                "image_prompts": state.get("episode_image_prompts") or [],
+                "tts_meta": state.get("episode_tts_meta") or [],
+            }
+            if prev["image_prompts"] and prev["tts_meta"]:
+                prev_materials = prev
+                print("    [素材生成] minor_revise → 局部微调（只改问题项，保留其余素材）")
         result = self.generate(
             state.get("current_episode") or {},
             revise,
+            prev_materials,
         )
         return {
             "episode_script": result.get("script", ""),
@@ -115,7 +136,8 @@ class MaterialGeneratorAgent:
         }
 
     def _build_user_msg(self, episode: Dict, char_profiles: List[Dict],
-                        revise_instruction: Optional[Dict]) -> str:
+                        revise_instruction: Optional[Dict],
+                        prev_materials: Optional[Dict] = None) -> str:
         from config import get_config
         cfg = get_config().media
         scenes_text = json.dumps(episode.get("scenes", []), ensure_ascii=False, indent=2)
@@ -123,6 +145,25 @@ class MaterialGeneratorAgent:
         revise_text = ""
         if revise_instruction:
             revise_text = f"\n\n【上一轮评审修改指令（必须据此修正）】\n{json.dumps(revise_instruction, ensure_ascii=False, indent=2)}"
+        prev_text = ""
+        if prev_materials:
+            prev_text = f"""
+
+【上一轮已生成的素材（局部微调基础，请原样保留未点名部分）】
+这是上一轮生成的三类素材。本次只做【局部微调】：
+- 仅修改评审修改指令中点名的问题项（对应场景的 script / 图像 prompt / TTS 段）
+- 未被点名的内容【必须原样保留】，不要改写、不要重排、不要新增
+- 图片/语音数量尽量与上一轮一致，改动范围越小越好
+
+上一轮 script：
+{prev_materials.get('script', '')}
+
+上一轮 image_prompts（JSON）：
+{json.dumps(prev_materials.get('image_prompts', []), ensure_ascii=False, indent=2)}
+
+上一轮 tts_meta（JSON）：
+{json.dumps(prev_materials.get('tts_meta', []), ensure_ascii=False, indent=2)}
+"""
         return f"""【本集 Episode 数据】
 {scenes_text}
 
@@ -133,7 +174,7 @@ class MaterialGeneratorAgent:
 每个角色的 image_description 字段为生图外貌依据：
 - 若含"用户指定·优先"前缀 → 必须以此描述为准，忽略其他外貌字段
 - 否则用 appearance+attire 组合
-{char_text}{revise_text}
+{char_text}{revise_text}{prev_text}
 
 【图片节奏参数】
 - 目标每图展示时长：{cfg.image_duration_target}秒
