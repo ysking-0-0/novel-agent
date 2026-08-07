@@ -42,13 +42,19 @@ def persistence_node(state: Dict) -> Dict:
     # ── 空集防护：素材全空（0图0段无文案）绝不归档 ──
     # LLM 连续失败且重试耗尽时，material_generator 可能返回空。此时归档 = 假进度，
     # 媒体合成阶段会因无图直接失败或产出空视频。宁可中断报错，也不写空集目录。
+    # 注意：防护不止"三者全空"——episode 残缺（scenes 为空）或图/TTS 为空也是假进度。
+    # 曾有 case：format 校验耗尽 → manual_review → 直送归档，script 有 81 字节残渣但
+    # scenes=0 图=0 TTS=0，被旧条件放行 → 产出 ep_061-063 垃圾集。这里加强拦截。
     imgs = state.get("episode_image_prompts") or []
     tts = state.get("episode_tts_meta") or []
     script = (state.get("episode_script") or "").strip()
-    if not imgs and not tts and not script:
+    episode = state.get("current_episode") or {}
+    ep_scenes = episode.get("scenes") or []
+    if (not imgs or not tts) or (not ep_scenes and not script):
         raise RuntimeError(
-            "拒绝归档空集：素材生成失败（image_prompts/tts_meta/script 全空）且重试耗尽。"
-            "请检查 LLM 输出后重跑该集。"
+            "拒绝归档空集：素材不完整（scenes=%d, image_prompts=%d, tts_meta=%d, script=%d字符）。"
+            "LLM 聚合/生成失败或重试耗尽，请检查后重跑该集。"
+            % (len(ep_scenes), len(imgs), len(tts), len(script))
         )
 
     episode = dict(state.get("current_episode") or {})
