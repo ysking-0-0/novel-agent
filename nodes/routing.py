@@ -94,7 +94,7 @@ def route_after_persistence(state: Dict) -> str:
 def route_after_media_quality(state: Dict) -> str:
     """媒体合成质检结果路由：
     - video_quality_ok=True → 正常进入终止判断（回 text_chunker / END）
-    - video_quality_ok=False 且未超重试 → 回 material_generator 整集重新生成
+    - video_quality_ok=False 且未超重试 → 回 retry_counter（由 route_after_retry 分流到媒体重合成）
     - video_quality_ok=False 且已超重试 → 标记人工复核后放行（防死循环）
     """
     quality_ok = state.get("video_quality_ok", True)
@@ -104,7 +104,7 @@ def route_after_media_quality(state: Dict) -> str:
     max_retry = cfg.run.max_retries
     retry = state.get("retry_count", 0)
     if retry < max_retry:
-        print(f"[质检] 视频不合格，回素材生成整集重生成 (retry={retry}/{max_retry})")
+        print(f"[质检] 视频不合格，回重试计数 → 复用素材重合成 (retry={retry}/{max_retry})")
         return "retry_counter"
     print(f"[质检] 重试超限({retry}>={max_retry})，标记人工复核后放行")
     rr = state.get("review_result") or {}
@@ -112,6 +112,19 @@ def route_after_media_quality(state: Dict) -> str:
     rr["manual_review_reason"] = "media_quality_exhausted"
     state["review_result"] = rr
     return "termination_check"
+
+
+# ---------- 重试计数后的分流 ----------
+def route_after_retry(state: Dict) -> str:
+    """retry_counter 递增后的去向：
+    - 质检失败重试（persistence 已清空 current_episode + video_quality_ok=False）
+      → 回 media_synthesizer，复用已归档素材重合成，避免空 episode 重生成垃圾。
+    - 评审 regenerate → 回 material_generator 整集重生成。
+    """
+    if state.get("current_episode") is None and state.get("video_quality_ok") is False:
+        print("[重试] 质检失败重试：回媒体合成（复用已归档素材），不重生成素材")
+        return "media_synthesizer"
+    return "material_generator"
 
 
 # ---------- 循环出口：text_chunker 读完后判断 ----------

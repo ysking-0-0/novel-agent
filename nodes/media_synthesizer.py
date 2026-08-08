@@ -50,11 +50,32 @@ def _emit(line: str):
 # ────────────── HTTP 调用（线程内复用 session） ──────────────
 _session_local = threading.local()
 
+# HTTP 自动重试策略：WSL 网络偶发抖动 / MiniMax 瞬时超时 / DNS 瞬时失败时，
+# 由 requests 适配器在应用层重试逻辑之外再做一层自动重试（指数退避，尊重 Retry-After）。
+# 注意：只在连接错误/超时/5xx 时重试，4xx（含 1002 限流）不在这里重试（由业务逻辑处理）。
+_HTTP_RETRY = requests.adapters.HTTPAdapter(
+    max_retries=requests.adapters.Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=0,          # 不因状态码重试（1002/1026/1027 等业务状态码由上层处理）
+        backoff_factor=2,  # 2s, 4s, 8s
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST", "GET"],
+        raise_on_status=False,
+    ),
+    pool_connections=20,
+    pool_maxsize=20,
+)
+
 
 def _get_session() -> requests.Session:
     s = getattr(_session_local, "session", None)
     if s is None:
         s = requests.Session()
+        # 全局统一挂适配器：连接超时 10s，读超时由具体请求 timeout 参数控制
+        s.mount("https://", _HTTP_RETRY)
+        s.mount("http://", _HTTP_RETRY)
         _session_local.session = s
     return s
 
@@ -1378,18 +1399,37 @@ def media_synthesizer_node(state: Dict, ep_id_override: str = None) -> Dict:
     if not prompts and not tts_meta:
         return {}
 
-    print("[合成] 开始 %s：生图 %d 张，TTS %d 段（并行）" % (eid, len(prompts), len(tts_meta)))
+    # 复用已有媒体：质检失败重试 / 重跑本集时 images/audio 已落盘，跳过生图/TTS 只重合成。
+    # 注意 generate_images/generate_tts 会清空旧文件，必须在此提前判断。
+    reuse_media = False
+    if prompts and tts_meta:
+        _img_dir = os.path.join(ep_dir, "images")
+        _aud_dir = os.path.join(ep_dir, "audio")
+        _n_img = len([f for f in os.listdir(_img_dir)
+                      if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]) if os.path.isdir(_img_dir) else 0
+        _n_aud = len([f for f in os.listdir(_aud_dir)
+                      if f.lower().endswith((".mp3", ".wav", ".m4a"))]) if os.path.isdir(_aud_dir) else 0
+        reuse_media = (_n_img >= len(prompts) and _n_aud >= len(tts_meta))
 
-    # 生图与 TTS 并行启动（两个独立线程池同时跑，互不阻塞）
-    image_paths: List = []
-    audio_paths: List = []
-    with ThreadPoolExecutor(max_workers=2) as parallel:
-        fut_img = parallel.submit(generate_images, episode, prompts, ep_dir) if prompts else None
-        fut_aud = parallel.submit(generate_tts, tts_meta, ep_dir) if tts_meta else None
-        if fut_img:
-            image_paths = fut_img.result()
-        if fut_aud:
-            audio_paths = fut_aud.result()
+    if reuse_media:
+        print("[合成] %s 复用已有媒体（%d图/%d音），跳过生图/TTS 直接重合成"
+              % (eid, len(prompts), len(tts_meta)))
+        image_paths: List = [p if os.path.exists(p) else None
+                             for p in _list_image_paths(ep_dir, len(prompts))]
+        audio_paths: List = [p if os.path.exists(p) else None
+                             for p in _list_audio_paths(ep_dir, len(tts_meta))]
+    else:
+        print("[合成] 开始 %s：生图 %d 张，TTS %d 段（并行）" % (eid, len(prompts), len(tts_meta)))
+        # 生图与 TTS 并行启动（两个独立线程池同时跑，互不阻塞）
+        image_paths: List = []
+        audio_paths: List = []
+        with ThreadPoolExecutor(max_workers=2) as parallel:
+            fut_img = parallel.submit(generate_images, episode, prompts, ep_dir) if prompts else None
+            fut_aud = parallel.submit(generate_tts, tts_meta, ep_dir) if tts_meta else None
+            if fut_img:
+                image_paths = fut_img.result()
+            if fut_aud:
+                audio_paths = fut_aud.result()
 
     # 缺图重试补全：对失败的图单独重试一轮（可能是临时网络/DNS 抖动）
     img_dir = os.path.join(ep_dir, "images")
@@ -1533,9 +1573,37 @@ def media_synthesizer_node(state: Dict, ep_id_override: str = None) -> Dict:
             print("[质检] %s 不通过：黑屏 %.1f%% 灰屏 %.1f%%（将触发整集重生成）"
                   % (eid, final_black, final_dark))
     else:
-        print("[合成] %s 视频未生成（图片/音频已落盘）" % eid)
+        print("[合成] %s 视频未生成（存在无图段，图片/音频已落盘）" % eid)
+        # 质检闭环：compose_video 因某 TTS 段无图而中断（返回 None）时，
+        # 自动为该段补生成图片并重合成，而不是直接判失败触发整集重生成。
+        # 旧逻辑直接判失败会经 retry_counter → material_generator，而此刻 state 的
+        # current_episode 已被 persistence 清空 → 生成占位垃圾集（ep_061-063 根因）。
         quality_ok = False
         final_black = final_dark = 0.0
+        try:
+            prompts3 = _fill_missing_segment_images(episode, prompts, tts_meta, ep_dir)
+            if len(prompts3) > len(prompts):
+                image_paths3 = [p if os.path.exists(p) else None
+                                for p in _list_image_paths(ep_dir, len(prompts3))]
+                video_path3 = compose_video(image_paths3, audio_paths, tts_meta,
+                                            ep_dir, eid, image_prompts=prompts3)
+                if video_path3:
+                    video_path = video_path3
+                    sz_mb = os.path.getsize(video_path) / (1024 * 1024)
+                    print("[合成] %s 补图后重合成完成: %s (%.1f MB)" % (eid, video_path, sz_mb))
+                    final_black = _detect_black_frames(video_path)
+                    final_dark = _detect_dark_frames(video_path)
+                    quality_ok = (final_black <= 5.0 and final_dark <= 8.0)
+                    if quality_ok:
+                        print("[质检] %s 补图后通过：黑屏 %.1f%% 灰屏 %.1f%%"
+                              % (eid, final_black, final_dark))
+                    else:
+                        print("[质检] %s 补图后仍不通过：黑屏 %.1f%% 灰屏 %.1f%%（将触发整集重生成）"
+                              % (eid, final_black, final_dark))
+        except Exception as e:
+            print("    [补图重合成] 异常: %s" % e)
+        if not video_path:
+            print("[合成] %s 补图后仍无法生成视频（图片/音频已落盘，等待人工处理）" % eid)
 
     # 集间间隔：让生图 API 的 RPM 限流配额恢复，避免下一集开头连续 429/1002 限流。
     # 用户反馈"第一集快第二集慢"即源于此。间隔只在实际还有下一集时生效（由 target 控制）。

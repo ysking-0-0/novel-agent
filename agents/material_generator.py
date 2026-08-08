@@ -87,6 +87,16 @@ class MaterialGeneratorAgent:
                 content_str = str(content)
                 print("    [素材生成] LLM 输出解析失败或为空 (attempt %d/3)，长度=%d，前200字: %s"
                       % (attempt + 1, len(content_str), content_str[:200].replace("\n", " ")))
+                # 重试前追加纠偏指令：模型偶发输出 <think> 思维链/截断导致解析失败，
+                # 明确要求直接输出合法 JSON、不要思考过程、不要用代码块包裹。
+                messages.append(HumanMessage(content=(
+                    "【解析失败，请重新输出】"
+                    "你上一次的输出无法被解析为合法 JSON（可能原因是：输出了 <think> 思维链、"
+                    "JSON 被截断不完整、或用 ``` 代码块包裹、或字段缺失）。"
+                    "请严格按要求重新输出：直接输出完整 JSON 对象（以 { 开头、以 } 结尾），"
+                    "禁止输出任何思考过程、禁止 ``` 代码块、必须包含 script / image_prompts / tts_meta 三个字段，"
+                    "image_prompts 和 tts_meta 都不得为空。"
+                )))
             except Exception as e:
                 print("    [素材生成] LLM 调用异常 (attempt %d/3): %s" % (attempt + 1, e))
             if attempt < 2:

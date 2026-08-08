@@ -32,7 +32,7 @@ from nodes import (
     persistence_node, retry_counter_node, media_synthesizer_node,
     route_after_aggregation, route_after_format_check,
     route_after_arbiter, route_after_persistence, route_after_chunking,
-    route_after_media_quality,
+    route_after_media_quality, route_after_retry,
 )
 from config import get_config
 
@@ -173,8 +173,15 @@ def build_graph(db_path: str = None):
         },
     )
 
-    # retry_counter → material_generator（整集重生成）
-    g.add_edge("retry_counter", "material_generator")
+    # retry_counter → 条件路由（评审 regenerate → material_generator；质检失败 → media_synthesizer 重合成）
+    g.add_conditional_edges(
+        "retry_counter",
+        route_after_retry,
+        {
+            "media_synthesizer": "media_synthesizer",
+            "material_generator": "material_generator",
+        },
+    )
 
     # persistence → media_synthesizer → 质检路由（合格→终止判断；不合格→整集重生成）
     g.add_edge("persistence", "media_synthesizer")
