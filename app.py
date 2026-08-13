@@ -34,7 +34,7 @@ import gradio as gr
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import set_config, get_config, apply_book, StorageConfig
 from prompts import load_prompt, save_prompt, list_prompts, list_style_presets, get_style_preset, save_style_preset, delete_style_preset
-from nodes.media_synthesizer import resynthesize_video, regenerate_episode_media
+from nodes.media_synthesizer import resynthesize_video, regenerate_episode_media, repair_missing_audio
 
 
 # ────────────── 书管理 ──────────────
@@ -694,6 +694,11 @@ def rerun_episode(ep_id):
     return _run_single_ep_task(ep_id, regenerate_episode_media, "重跑本集")
 
 
+def repair_audio(ep_id):
+    """检查并补全本集缺失的音频段，重合成视频（不动图片/LLM 产物）。"""
+    return _run_single_ep_task(ep_id, repair_missing_audio, "补缺失音频")
+
+
 # ────────────── 提示词管理 ──────────────
 def load_prompt_content(name):
     """加载指定 agent 的 prompt 到编辑框。"""
@@ -986,6 +991,8 @@ def build_ui():
                     refresh_ep_btn = gr.Button("🔄 刷新集列表")
                     resynth_btn = gr.Button("📝 仅重合成视频（补字幕/换BGM）",
                                             variant="secondary", elem_id="btn-resynth")
+                    repair_aud_btn = gr.Button("🔊 补缺失音频并重合成",
+                                               variant="secondary", elem_id="btn-repair-audio")
                     rerun_btn = gr.Button("♻️ 重跑本集（生图+TTS+视频）",
                                           variant="stop", elem_id="btn-rerun")
                     ep_task_status = gr.Textbox(label="单集任务状态", interactive=False,
@@ -1013,6 +1020,9 @@ def build_ui():
                 )
                 resynth_btn.click(
                     fn=resynth_video, inputs=ep_choices, outputs=ep_task_status,
+                )
+                repair_aud_btn.click(
+                    fn=repair_audio, inputs=ep_choices, outputs=ep_task_status,
                 )
                 rerun_btn.click(
                     fn=rerun_episode, inputs=ep_choices, outputs=ep_task_status,

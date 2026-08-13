@@ -718,6 +718,50 @@ def generate_tts(tts_meta: List[Dict], ep_dir: str) -> List[Optional[str]]:
     return results
 
 
+def _retry_generate_tts(tts_meta: List[Dict], missing_idxs: List[int], ep_dir: str) -> Dict[int, str]:
+    """对缺失音频段单独重试 TTS（不清理已有文件），返回 {idx: path} 成功的。
+
+    与 generate_tts 的区别：只补 missing_idxs 指定的段，绝不删除已成功落盘的音频，
+    避免并发失败后重试把已成功段一起清掉（ep_072 缺 5 段音频的根因之一）。
+    """
+    cfg = get_config()
+    audio_dir = os.path.join(ep_dir, "audio")
+    os.makedirs(audio_dir, exist_ok=True)
+
+    items = [(i, tts_meta[i]) for i in missing_idxs if i < len(tts_meta)]
+    if not items:
+        return {}
+
+    results: Dict[int, str] = {}
+
+    def _one(idx_meta):
+        idx, m = idx_meta
+        text = m.get("text", "")
+        if not text.strip():
+            return idx, None
+        voice_id = _resolve_voice_id(m.get("voice", ""))
+        speed = float(m.get("speed", 1.08))
+        audio = _call_tts_api(
+            text, voice_id,
+            m.get("emotion", "neutral"),
+            speed,
+        )
+        if not audio:
+            return idx, None
+        dest = os.path.join(audio_dir, "%03d.mp3" % idx)
+        with open(dest, "wb") as f:
+            f.write(audio)
+        return idx, dest
+
+    with ThreadPoolExecutor(max_workers=max(1, int(getattr(cfg.media, "tts_concurrency", 4)))) as pool:
+        futs = {pool.submit(_one, item): item[0] for item in items}
+        for fut in as_completed(futs):
+            idx, path = fut.result()
+            if path:
+                results[idx] = path
+    return results
+
+
 # ────────────── 视频合成（FFmpeg） ──────────────
 def _ffmpeg_path() -> str:
     try:
@@ -958,6 +1002,8 @@ def _make_clip(image_path: Optional[str], audio_path: Optional[str],
         dur = duration if duration is not None else 3.0
 
     vdur = dur + max(0.0, video_extend)
+    # 帧对齐：输出 -t 必须是 1/fps 的整数倍，避免 concat 重编码时补/丢帧
+    vdur = max(0.1, round(vdur * fps) / fps)
     w, h = resolution.split("x")
     W = int(w)
     H = int(h)
@@ -1181,7 +1227,8 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
         else:
             seg_dur = 3.0
         # 用 start_ratio 精确计算每张图的起点与时长
-        # 该图起点 = start_ratio * seg_dur；时长 = 下张图起点 - 本张图起点（末张=段尾）
+        # 段内分片语义：首图从段起点（t=0, audio_seek=0）开始，保证每段解说
+        # 从头到尾连续、不丢段首语音；后续图在各自 start_ratio 处切换。
         starts = [img["start_ratio"] * seg_dur for img in imgs]
         # 保证最后一张覆盖到段尾
         for i in range(len(starts) - 1, -1, -1):
@@ -1194,9 +1241,14 @@ def compose_video(image_paths: List[Optional[str]], audio_paths: List[Optional[s
         # 每张图时长 = 下张起点 - 本张起点；末张 = seg_dur - 本张起点
         extend_secs = float(getattr(cfg.media, "ending_extend_seconds", 0.0))
         for i, img in enumerate(imgs):
-            t_start = starts[i]
+            # 首图 t_start 固定 0（audio_seek=0），不因 start_ratio 截掉段首语音；
+            # 否则首图 clip 会 seek 到 starts[0]，导致每段开头解说被吞（如"电光"缺失只剩"滋滋"）。
+            t_start = 0.0 if i == 0 else starts[i]
             t_end = starts[i + 1] if i + 1 < len(imgs) else seg_dur
             per_img = max(0.3, t_end - t_start)  # 最小0.3s
+            # 帧对齐：clip 时长必须是 1/fps 的整数倍，否则 concat + -r 收帧时
+            # ffmpeg 会在拼接边界补/丢帧维持恒定帧率 → 偶发卡顿（ep_90+ 尤为明显）。
+            per_img = max(0.3, round(per_img * cfg.media.video_fps) / cfg.media.video_fps)
             # 平移方向交替：偶数 idx 从上往下，奇数从下往上
             pan_dir = "down" if clip_idx % 2 == 0 else "up"
             # 结尾延长：全局最后一张图（最后一段的最后一张）视频延长 extend 秒，
@@ -1477,6 +1529,21 @@ def media_synthesizer_node(state: Dict, ep_id_override: str = None) -> Dict:
     still_missing = sum(1 for p in image_paths if not p)
     if still_missing:
         print("    [补图] 仍有 %d 张图无法占位（首图就失败）" % still_missing)
+
+    # ── 音频完整性检查步骤：缺失的 TTS 段单独补跑，避免无声段进视频 ──
+    # generate_tts 并发偶发失败（限流/网络抖动）返回 None，若不补跑，
+    # compose_video 会用 anullsrc 静音占位（每段 3s），成片对应段落无声。
+    missing_aud = [i for i, p in enumerate(audio_paths) if not p or not (p and os.path.exists(p))]
+    if missing_aud and tts_meta:
+        print("    [补音频] %d/%d 段音频缺失，单独重试 TTS" % (len(missing_aud), len(tts_meta)))
+        retry_aud = _retry_generate_tts(tts_meta, missing_aud, ep_dir)
+        for i, path in retry_aud.items():
+            if path:
+                audio_paths[i] = path
+                print("    [补音频] 第%d段重试成功" % (i + 1))
+    still_missing_aud = sum(1 for p in audio_paths if not p or not (p and os.path.exists(p)))
+    if still_missing_aud:
+        print("    [补音频] 警告：仍有 %d 段音频缺失，将用静音占位" % still_missing_aud)
 
     print("  [阶段3] 拼接视频（Ken Burns 平移 + start_ratio 对齐）...")
     video_path = compose_video(image_paths, audio_paths, tts_meta, ep_dir, eid,
@@ -1813,4 +1880,59 @@ def regenerate_episode_media(ep_id: str) -> Optional[str]:
         print("[重跑] %s 完成: %s" % (ep_id, video_path))
     else:
         print("[重跑] %s 失败" % ep_id)
+    return video_path
+
+
+def repair_missing_audio(ep_id: str) -> Optional[str]:
+    """检查并补全某集缺失的音频段，然后重新合成视频。
+
+    场景：并发 TTS 偶发失败导致成片某几段无声（如 ep_072 缺 1,2,3,5,6）。
+    只补缺失的 TTS 段 + 重拼视频，不动图片 / LLM 产物 / 已成功的音频。
+    """
+    cfg = get_config()
+    out_dir = cfg.storage.output_dir
+    ep_dir = os.path.join(out_dir, ep_id)
+    if not os.path.isdir(ep_dir):
+        print("[补音频] %s 不存在" % ep_id)
+        return None
+    try:
+        episode, prompts, tts_meta = _load_ep_meta(ep_dir)
+    except Exception as e:
+        print("[补音频] %s 读取归档失败: %s" % (ep_id, e))
+        return None
+
+    audio_paths = [p if os.path.exists(p) else None
+                   for p in _list_audio_paths(ep_dir, len(tts_meta))]
+    missing = [i for i, p in enumerate(audio_paths) if not p]
+    if missing:
+        print("[补音频] %s：%d/%d 段音频缺失，开始补 TTS..." % (ep_id, len(missing), len(tts_meta)))
+        retry_aud = _retry_generate_tts(tts_meta, missing, ep_dir)
+        for i, path in retry_aud.items():
+            if path:
+                audio_paths[i] = path
+                print("    [补音频] 第%d段补成功" % (i + 1))
+    still = [i for i, p in enumerate(audio_paths) if not p]
+    if still:
+        print("[补音频] %s 仍有 %d 段无法补全: %s（将静音占位）" % (ep_id, len(still), still))
+
+    # 音频齐全才值得重合成；若仍缺很多且无音频，则无意义，直接提示
+    if len(still) >= len(tts_meta):
+        print("[补音频] %s 音频几乎全缺，改用整集重跑（regenerate_episode_media）" % ep_id)
+        return None
+
+    image_paths = [p if os.path.exists(p) else None
+                   for p in _list_image_paths(ep_dir, len(prompts))]
+    old_mp4 = os.path.join(ep_dir, "%s.mp4" % ep_id)
+    if os.path.exists(old_mp4):
+        os.remove(old_mp4)
+    sub_dir = os.path.join(ep_dir, "_subs")
+    if os.path.isdir(sub_dir):
+        shutil.rmtree(sub_dir, ignore_errors=True)
+    print("[补音频] %s：音频补全后重合成视频（%d 图 / %d 音频）" % (ep_id, len(image_paths), len(audio_paths)))
+    video_path = compose_video(image_paths, audio_paths, tts_meta, ep_dir, ep_id,
+                               image_prompts=prompts)
+    if video_path:
+        print("[补音频] %s 完成: %s" % (ep_id, video_path))
+    else:
+        print("[补音频] %s 重合成失败" % ep_id)
     return video_path
