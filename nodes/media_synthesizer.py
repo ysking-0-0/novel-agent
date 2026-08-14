@@ -556,9 +556,64 @@ def _decode_audio(audio_str: str) -> bytes:
     return audio_str.encode("utf-8", errors="ignore")
 
 
+def _fix_tts_punctuation(text: str) -> str:
+    """TTS 朗读文本断句预处理（防 TTS 断句错位）。
+
+    MiniMax TTS 严格按标点断句。历史问题：被动句"XX被YY"连写时，
+    TTS 常在"被"前错误停顿，导致听感像"XX / 被YY"（缺主语），
+    如"两位巨擘被这黄口小儿激怒"被读成"两位巨擘…被这黄口小儿"。
+    这里对已知风险模式做标点修复，不影响语义与字幕内容。
+
+    规则：
+    1. 被动句"XX被YY"：主语后补逗号 → "XX，被YY"
+       - 仅当"被"前是纯名词短语（不含标点/连接词），避免误改
+    2. 超长无标点句（>25字无逗号/顿号）：在语气词/连接词后补逗号
+    3. 不处理已含标点的正确句子，尽量少改动
+    """
+    if not text:
+        return text
+    import re as _re
+    orig = text
+    # 规则1：被动句主语后补逗号。
+    # "XX被YY" → "XX，被YY"。用 lookbehind 取"被"前的 1-12 字名词短语。
+    # 仅当"被"后紧跟的是动词性内容（非"被子/被窝/被单"等名词）才处理。
+    # 主语太短（≤1字）不补；主语含标点/连接词不补（已有停顿）。
+    # 主语 = 被 之前的 1-12 个汉字（要求前一个字符不是标点/汉字结尾边界）
+    # 排除"被子/被窝/被单/被褥/被套/被罩"等名词（"被"+名词后缀），不当作被动句
+    text = _re.sub(
+        r"(?<![，。、；：,.])"          # 主语前不能是标点（否则已是新句）
+        r"([\u4e00-\u9fff]{2,12})"    # 主语（2-12字）
+        r"(被)(?![子窝单褥套罩])",     # "被"后不是名词后缀才处理
+        lambda m: m.group(1) + "，" + m.group(2),
+        text,
+    )
+
+    # 规则2：超长无标点句补逗号（在常见连接/语气词后断句）。
+    # 匹配 ≥26 字连续无标点片段，在"于是|便|又|而|且|并|但|却|就|竟|认为"后补逗号。
+    def _long(m):
+        seg = m.group(0)
+        if len(seg) < 26:
+            return seg
+        # 找最后一个连接词位置（从后往前，保证切分点靠后、语义连贯）
+        idx = -1
+        wlen = 0
+        for w in ("于是", "认为", "便", "又", "而", "且", "并", "但", "却", "就", "竟"):
+            pos = seg.rfind(w)
+            if pos > 0 and pos > idx:
+                idx = pos
+                wlen = len(w)
+        if idx > 0 and idx < len(seg) - 1:
+            return seg[:idx + wlen] + "，" + seg[idx + wlen:]
+        return seg
+    text = _re.sub(r"[\u4e00-\u9fff]{26,}", _long, text)
+    return text
+
+
 def _call_tts_api(text: str, voice_id: str, emotion: str, speed: float) -> Optional[bytes]:
     """调用 MiniMax TTS，返回 mp3 bytes 或 None。"""
     cfg = get_config()
+    # 断句预处理：防 TTS 在被动句/长句处断句错位（如"XX被YY"读成缺主语）
+    text = _fix_tts_punctuation(text)
     payload = {
         "model": cfg.media.tts_model,
         "text": text,

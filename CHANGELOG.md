@@ -11,12 +11,17 @@
 ### 修复
 
 #### 1. TTS 异常长停顿压缩 — `nodes/media_synthesizer.py` / `config.py`
-- **根因**：TTS 偶发在逗号/句号后生成 0.7-0.9s 的异常长停顿（正常 0.3-0.5s），用户听感为句子中间"卡顿"
-- **修复**：新增 `_compress_long_silences()`，把 >`silence_max_pause`（默认 0.5s）的静音段压缩到 `silence_target_pause`（默认 0.35s），其余正常停顿原样保留，尽量不影响自然朗读节奏。`generate_tts` / `_retry_generate_tts` 落盘后自动调用
+- **根因**：TTS 偶发在逗号/句号后生成 0.7-0.9s 的异常长停顿（听感=语音卡顿）
+- **修复**：新增 `_compress_long_silences()`，只压缩 >`silence_max_pause`（默认 0.8s）的异常停顿到 `silence_target_pause`（默认 0.55s）；0.5-0.8s 的自然句间/转折停顿（换气感）原样保留。`generate_tts` / `_retry_generate_tts` 落盘后自动调用
 - 开关：`media.silence_max_pause=0` 关闭；压缩失败/无超长停顿时不改动原文件
 
 #### 2. 统一旁白音色 — `nodes/media_synthesizer.py`
 - 按用户要求，`_resolve_voice_id` 不再按角色名/voice 字段分配音色，一律返回旁白音色（`voice_mapping["narrator"]`，兜底 `default_voice_id`）
+
+#### 3. TTS 断句错位防护 — `nodes/media_synthesizer.py` / `prompts/material_generator.md`
+- **根因**（ep_093 用户反馈）：TTS 严格按标点断句，被动句"XX被YY"连写时在"被"前错误停顿，听感像"XX / 被YY"缺主语（如"两位巨擘被这黄口小儿激怒"读成"两位巨擘…被这黄口小儿"）
+- **修复**：新增 `_fix_tts_punctuation()`，在 `_call_tts_api` 内统一调用——被动句主语后补逗号（"XX，被YY"，排除"被子/被窝/被单"等名词）、超长无标点句（≥26字）在连接词后补逗号；不影响语义与字幕内容
+- **源头约束**：`material_generator.md` 新增「朗读断句要求」——tts 段 30-70 字、短句为主、被动句必须"XX，被YY"写法
 
 ### 文档
 - `config.example.json` 新增 `silence_max_pause` / `silence_target_pause` 示例
