@@ -158,12 +158,12 @@ class MediaConfig:
     subtitle_font_size: int = int(os.getenv("SUBTITLE_FONT_SIZE", "42"))
     # 字幕字体文件路径（空=自动探测系统 CJK 字体；也可手动指定 ttf/ttc 路径）
     subtitle_font: str = os.getenv("SUBTITLE_FONT", "")
-    # 角色音色映射：tts_meta.voice 值（角色名/旁白标识）→ MiniMax voice_id
+    # 音色映射：TTS 音色统一使用 narrator 旁白（_resolve_voice_id 忽略 voice 字段，
+    # 直接取 voice_mapping["narrator"]）。其余条目保留供手动指定/回退。
     # 可用 voice_id（MiniMax）：
     #   Chinese_gravelly_storyteller_nv1（中文沉稳旁白/说书人，沙哑磁性）
     #   Chinese (Mandarin)_Sweet_Lady（中文甜美女声）
     #   male-qn-badao（男霸道，占位待替换）
-    # 旁白用 narrator，女性角色用 Sweet_Lady
     voice_mapping: dict = field(default_factory=lambda: {
         "narrator": "Chinese_gravelly_storyteller_nv1",
         "narrator_male": "Chinese_gravelly_storyteller_nv1",
@@ -174,6 +174,12 @@ class MediaConfig:
     })
     # 默认音色（voice_mapping 中找不到时用）
     default_voice_id: str = os.getenv("DEFAULT_VOICE_ID", "Chinese_gravelly_storyteller_nv1")
+    # TTS 停顿压缩：只处理真正异常的停顿（>0.8s），
+    # 0.5-0.8s 是 TTS 自然的句间/转折停顿（换气感），保留不动。
+    # 异常停顿压缩到 silence_target_pause（保留足够换气空隙）。
+    # 设 silence_max_pause=0 可关闭。
+    silence_max_pause: float = float(os.getenv("SILENCE_MAX_PAUSE", "0.8"))
+    silence_target_pause: float = float(os.getenv("SILENCE_TARGET_PAUSE", "0.55"))
 
 
 @dataclass

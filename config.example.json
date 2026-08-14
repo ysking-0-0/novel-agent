@@ -40,6 +40,8 @@
       "薪火": "Chinese (Mandarin)_Sweet_Lady"
     },
     "default_voice_id": "Chinese_gravelly_storyteller_nv1",
+    "silence_max_pause": 0.8,
+    "silence_target_pause": 0.55,
     "image_duration_target": 10.0,
     "bgm_path": "./assets/bgm.mp3",
     "bgm_volume": 0.25,

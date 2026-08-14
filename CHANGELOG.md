@@ -4,6 +4,25 @@
 
 ---
 
+## [TTS 停顿修复 + 统一旁白音色] — 2026-08
+
+在 `60a51d5` 基础上修复 **TTS 偶发超长停顿（听感=语音卡顿）**，并按要求统一全部语音为旁白音色。
+
+### 修复
+
+#### 1. TTS 异常长停顿压缩 — `nodes/media_synthesizer.py` / `config.py`
+- **根因**：TTS 偶发在逗号/句号后生成 0.7-0.9s 的异常长停顿（正常 0.3-0.5s），用户听感为句子中间"卡顿"
+- **修复**：新增 `_compress_long_silences()`，把 >`silence_max_pause`（默认 0.5s）的静音段压缩到 `silence_target_pause`（默认 0.35s），其余正常停顿原样保留，尽量不影响自然朗读节奏。`generate_tts` / `_retry_generate_tts` 落盘后自动调用
+- 开关：`media.silence_max_pause=0` 关闭；压缩失败/无超长停顿时不改动原文件
+
+#### 2. 统一旁白音色 — `nodes/media_synthesizer.py`
+- 按用户要求，`_resolve_voice_id` 不再按角色名/voice 字段分配音色，一律返回旁白音色（`voice_mapping["narrator"]`，兜底 `default_voice_id`）
+
+### 文档
+- `config.example.json` 新增 `silence_max_pause` / `silence_target_pause` 示例
+
+---
+
 ## [Windows 原生兼容] — 2025-07
 
 在 `747d916`（字幕 PIL 渲染版）基础上修复 **Windows 原生运行**时字幕显示方块、Gradio 日志乱码两个问题。项目原本在 WSL 下开发验证，Windows 原生 Python 运行时存在编码/路径差异，此版本补齐兼容。

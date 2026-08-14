@@ -16,6 +16,7 @@ novel_pipeline.nodes.media_synthesizer
 import os
 import re
 import json
+import math
 import base64
 import time
 import shutil
@@ -610,25 +611,14 @@ def _call_tts_api(text: str, voice_id: str, emotion: str, speed: float) -> Optio
 
 
 def _resolve_voice_id(voice_field: str) -> str:
-    """把 tts_meta.voice（角色名/旁白标识）映射到 MiniMax voice_id。
-    精确匹配 voice_mapping → 模糊匹配（含关键词）→ 默认音色。
+    """把 tts_meta.voice 映射到 MiniMax voice_id。
+
+    2026-08 用户要求：全部语音统一使用旁白音色，不再按角色分配音。
+    忽略 voice 字段（含 narrator/角色名/组合格式如"钟岳/薪火"），
+    一律返回旁白音色（voice_mapping["narrator"]，兜底 default_voice_id）。
     """
     cfg = get_config()
-    if not voice_field:
-        return cfg.media.default_voice_id
-    vf = voice_field.strip()
-    # 精确匹配
-    if vf in cfg.media.voice_mapping:
-        return cfg.media.voice_mapping[vf]
-    # 模糊匹配（voice_field 含 mapping 的某个 key）
-    for key, vid in cfg.media.voice_mapping.items():
-        if key in vf or vf in key:
-            return vid
-    # 兼容旧格式 character_male / character_female
-    if "female" in vf.lower():
-        return cfg.media.voice_mapping.get("narrator_female", "female-shaonv")
-    # 未映射的角色名 → 默认音色
-    return cfg.media.default_voice_id
+    return cfg.media.voice_mapping.get("narrator", cfg.media.default_voice_id)
 
 
 # MiniMax T2A 支持的 emotion 白名单 + pipeline 产出值到白名单的映射
@@ -704,6 +694,11 @@ def generate_tts(tts_meta: List[Dict], ep_dir: str) -> List[Optional[str]]:
         dest = os.path.join(audio_dir, "%03d.mp3" % idx)
         with open(dest, "wb") as f:
             f.write(audio)
+        # 压缩异常长停顿（TTS 偶发 0.7-0.9s 停顿=语音卡顿）
+        if _compress_long_silences(dest,
+                                   getattr(cfg.media, "silence_max_pause", 0.5),
+                                   getattr(cfg.media, "silence_target_pause", 0.35)):
+            print("    [TTS] %03d 压缩超长停顿" % (idx + 1))
         return idx, dest
 
     with ThreadPoolExecutor(max_workers=cfg.media.tts_concurrency) as pool:
@@ -751,6 +746,10 @@ def _retry_generate_tts(tts_meta: List[Dict], missing_idxs: List[int], ep_dir: s
         dest = os.path.join(audio_dir, "%03d.mp3" % idx)
         with open(dest, "wb") as f:
             f.write(audio)
+        if _compress_long_silences(dest,
+                                   getattr(cfg.media, "silence_max_pause", 0.5),
+                                   getattr(cfg.media, "silence_target_pause", 0.35)):
+            print("    [TTS] %03d 压缩超长停顿" % (idx + 1))
         return idx, dest
 
     with ThreadPoolExecutor(max_workers=max(1, int(getattr(cfg.media, "tts_concurrency", 4)))) as pool:
@@ -769,6 +768,108 @@ def _ffmpeg_path() -> str:
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return "ffmpeg"
+
+
+def _compress_long_silences(mp3_path: str, max_pause: float = 0.5,
+                            target_pause: float = 0.35,
+                            threshold: float = 0.03) -> bool:
+    """压缩 mp3 中异常长的静音停顿（听感=语音卡顿）。
+
+    TTS 偶发在逗号/句号后生成 0.7-0.9s 的异常长停顿（正常 0.3-0.5s），
+    用户听感为句子中间"卡顿"。这里把 >max_pause 的静音段截短到 target_pause，
+    其余停顿（含正常标点停顿）原样保留，尽量不影响自然朗读节奏。
+    返回是否实际修改了文件（覆盖写回 mp3）。
+    """
+    if max_pause <= 0:
+        return False
+    exe = _ffmpeg_path()
+    tmp_wav = mp3_path + ".tmp_sil.wav"
+    try:
+        r = subprocess.run(
+            [exe, "-y", "-i", mp3_path, "-ac", "1", "-ar", "24000", tmp_wav],
+            capture_output=True, timeout=60,
+        )
+        if r.returncode != 0 or not os.path.exists(tmp_wav):
+            return False
+        import wave as _wave
+        import struct as _struct
+        w = _wave.open(tmp_wav, "rb")
+        sr = w.getframerate()
+        data = w.readframes(w.getnframes())
+        w.close()
+        if not data:
+            return False
+        samples = list(_struct.unpack("<%dh" % (len(data) // 2), data))
+        n = len(samples)
+        # 静音检测：10ms 窗口 RMS < 峰值*threshold
+        win = max(1, int(sr * 0.01))
+        peak = max(1.0, max(abs(s) for s in samples))
+        thr = peak * threshold
+        silences = []
+        i = 0
+        while i <= n - win:
+            s = samples[i:i + win]
+            rms = math.sqrt(sum(x * x for x in s) / len(s))
+            if rms < thr:
+                st = i
+                i += win
+                while i <= n - win:
+                    s2 = samples[i:i + win]
+                    rms2 = math.sqrt(sum(x * x for x in s2) / len(s2))
+                    if rms2 < thr:
+                        i += win
+                    else:
+                        break
+                silences.append((st, i))
+            else:
+                i += win
+        # 只压缩超长段，其余保留
+        changed = False
+        out_parts = []
+        pos = 0
+        for st, en in silences:
+            d = (en - st) / sr
+            if d > max_pause:
+                target = int(target_pause * sr)
+                target = max(win, min(target, en - st))
+                keep_start = st + (en - st - target) // 2
+                keep_end = keep_start + target
+                out_parts.append(samples[pos:st])
+                out_parts.append(samples[keep_start:keep_end])
+                pos = en
+                changed = True
+        if not changed:
+            return False
+        out_parts.append(samples[pos:])
+        new_samples = []
+        for chunk in out_parts:
+            new_samples.extend(chunk)
+        tmp_out = mp3_path + ".tmp_sil_out.wav"
+        w2 = _wave.open(tmp_out, "wb")
+        w2.setnchannels(1)
+        w2.setsampwidth(2)
+        w2.setframerate(sr)
+        w2.writeframes(_struct.pack("<%dh" % len(new_samples), *new_samples))
+        w2.close()
+        r2 = subprocess.run(
+            [exe, "-y", "-i", tmp_out, "-ac", "1", "-ar", "24000",
+             "-b:a", "128k", mp3_path],
+            capture_output=True, timeout=60,
+        )
+        try:
+            os.remove(tmp_out)
+        except Exception:
+            pass
+        return r2.returncode == 0
+    except Exception as e:
+        print("    [TTS] 静音压缩失败 %s: %s" % (mp3_path, e))
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp_wav):
+                os.remove(tmp_wav)
+        except Exception:
+            pass
 
 
 def _audio_duration(path: str) -> float:
